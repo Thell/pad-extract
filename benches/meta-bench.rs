@@ -22,14 +22,14 @@ const FILE_FILTER: &str = r"bss$";
 
 fn b1_parse(bench: &mut Bencher) {
     bench.iter(|| {
-        let meta = MetaFile::new(&ROOT, ICE_KEY).expect("meta parsing error");
+        let meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         bencher::black_box(meta);
     });
 }
 
 fn b2_filter_path(bench: &mut Bencher) {
     bench.iter(|| {
-        let mut meta = MetaFile::new(&ROOT, ICE_KEY).expect("meta parsing error");
+        let mut meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         meta.filter_by_path(PATH_FILTER).expect("path filter error");
         bencher::black_box(meta);
     });
@@ -37,7 +37,7 @@ fn b2_filter_path(bench: &mut Bencher) {
 
 fn b3_filter_file(bench: &mut Bencher) {
     bench.iter(|| {
-        let mut meta = MetaFile::new(&ROOT, ICE_KEY).expect("meta parsing error");
+        let mut meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         meta.filter_by_file(FILE_FILTER).expect("path filter error");
         bencher::black_box(meta);
     });
@@ -45,7 +45,7 @@ fn b3_filter_file(bench: &mut Bencher) {
 
 fn b4_filter_path_and_file(bench: &mut Bencher) {
     bench.iter(|| {
-        let mut meta = MetaFile::new(&ROOT, ICE_KEY).expect("meta parsing error");
+        let mut meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         meta.filter_by_path(PATH_FILTER).expect("path filter error");
         meta.filter_by_file(FILE_FILTER).expect("path filter error");
         bencher::black_box(meta);
@@ -54,7 +54,7 @@ fn b4_filter_path_and_file(bench: &mut Bencher) {
 
 fn b5_read_raw(bench: &mut Bencher) {
     bench.iter(|| {
-        let mut meta = MetaFile::new(&ROOT, ICE_KEY).expect("meta parsing error");
+        let mut meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         meta.filter_by_path(PATH_FILTER).expect("path filter error");
         meta.filter_by_file(FILE_FILTER).expect("path filter error");
         meta.meta_table.par_iter().for_each(|mr| {
@@ -66,7 +66,7 @@ fn b5_read_raw(bench: &mut Bencher) {
 
 fn b6_read_decrypted(bench: &mut Bencher) {
     bench.iter(|| {
-        let mut meta = MetaFile::new(&ROOT, ICE_KEY).expect("meta parsing error");
+        let mut meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         meta.filter_by_path(PATH_FILTER).expect("path filter error");
         meta.filter_by_file(FILE_FILTER).expect("path filter error");
         meta.meta_table.par_iter().for_each(|mr| {
@@ -78,7 +78,7 @@ fn b6_read_decrypted(bench: &mut Bencher) {
 
 fn b7_read_decompressed(bench: &mut Bencher) {
     bench.iter(|| {
-        let mut meta = MetaFile::new(&ROOT, ICE_KEY).expect("meta parsing error");
+        let mut meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         meta.filter_by_path(PATH_FILTER).expect("path filter error");
         meta.filter_by_file(FILE_FILTER).expect("path filter error");
         meta.meta_table.par_iter().for_each(|mr| {
@@ -91,7 +91,7 @@ fn b7_read_decompressed(bench: &mut Bencher) {
 fn b8_extract(bench: &mut Bencher) {
     bench.iter(|| {
         let out = PathBuf::from("./").canonicalize().unwrap().join("bench-out");
-        let mut meta = MetaFile::new(&ROOT, ICE_KEY).expect("meta parsing error");
+        let mut meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         meta.filter_by_path(PATH_FILTER).expect("path filter error");
         meta.filter_by_file(FILE_FILTER).expect("path filter error");
         meta.extract_many(&ReadLevel::Decompress, &out).expect("extract failed");

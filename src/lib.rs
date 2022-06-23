@@ -59,12 +59,11 @@ impl MetaFile {
     // efficient filtering and extraction directly using the path table bucket indices
     // on the meta table records.
     // In order to filter by bucket indices the meta table needs to be sorted by file index.
-    pub fn new(root: &Path, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
+    pub fn new(buf: &mut Vec<u8>, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
         let ice = Ice::new(0, key);
+        let root = PathBuf::new();
 
-        let metafile = PathBuf::from("pad00000.meta");
-        let mut buf = std::fs::read(root.join(metafile))?;
-        let mut reader = Cursor::new(&mut buf);
+        let mut reader = Cursor::new(&mut *buf);
 
         let version = reader.read_u32::<LittleEndian>().unwrap();
 
@@ -85,7 +84,7 @@ impl MetaFile {
 
         let meta_file = MetaFile {
             ice,
-            root: root.to_path_buf(),
+            root,
             version,
             package_table,
             meta_table,
@@ -93,6 +92,14 @@ impl MetaFile {
             file_table,
         };
         Ok(meta_file)
+    }
+
+    pub fn new_from_path(root: &Path, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
+        let metafile = PathBuf::from("pad00000.meta");
+        let mut buf = std::fs::read(root.join(metafile))?;
+        let mut meta = Self::new(&mut buf, key)?;
+        meta.root = root.to_path_buf();
+        Ok(meta)
     }
 
     pub fn extract(

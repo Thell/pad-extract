@@ -13,7 +13,7 @@ fn meta_parse() {
     // pretty simple and each block is interdependent. The only part that might
     // be 'different' is the string handling since it has dynamic length but
     // that isn't worth breaking up into multiple tests.
-    let meta = MetaFile::new(&ROOT, KEY).expect("meta parsing error");
+    let meta = MetaFile::new_from_path(&ROOT, KEY).expect("meta parsing error");
 
     // Version
     assert_eq!(meta.version, 1892, "version mismatch");
@@ -90,7 +90,7 @@ fn path_filter() {
     // tables.
 
     // Filters without qualifiers.
-    let mut meta = MetaFile::new(&ROOT, KEY).expect("meta parsing error");
+    let mut meta = MetaFile::new_from_path(&ROOT, KEY).expect("meta parsing error");
     let old_package_table_len = meta.package_table.len();
     let old_path_table_len = meta.path_table.len();
     let old_file_table_len = meta.file_table.len();
@@ -101,7 +101,7 @@ fn path_filter() {
     assert_eq!(meta.meta_table.len(), 156958, "(w/o qualifiers)meta table len mismatch");
 
     // Filters with qualifiers.
-    let mut meta = MetaFile::new(&ROOT, KEY).expect("meta parsing error");
+    let mut meta = MetaFile::new_from_path(&ROOT, KEY).expect("meta parsing error");
     meta.filter_by_path("^character/ai_.*k/").expect("(w/ qualifiers) path filter error");
     assert_eq!(meta.package_table.len(), old_package_table_len, "(w/ qualifiers) package table len mismatch");
     assert_eq!(meta.path_table.len(), old_path_table_len, "(w/ qualifiers)path table len mismatch");
@@ -116,7 +116,7 @@ fn file_filter() {
     // tables.
 
     // Filters without qualifiers.
-    let mut meta = MetaFile::new(&ROOT, KEY).expect("meta parsing error");
+    let mut meta = MetaFile::new_from_path(&ROOT, KEY).expect("meta parsing error");
     let old_package_table_len = meta.package_table.len();
     let old_path_table_len = meta.path_table.len();
     let old_file_table_len = meta.file_table.len();
@@ -127,7 +127,7 @@ fn file_filter() {
     assert_eq!(meta.meta_table.len(), 40, "(w/o qualifiers)meta table len mismatch");
 
     // Filters with qualifiers.
-    let mut meta = MetaFile::new(&ROOT, KEY).expect("meta parsing error");
+    let mut meta = MetaFile::new_from_path(&ROOT, KEY).expect("meta parsing error");
     meta.filter_by_file("^cloud.*fx").expect("(w/ qualifiers) path filter error");
     assert_eq!(meta.package_table.len(), old_package_table_len, "(w/ qualifiers) package table len mismatch");
     assert_eq!(meta.path_table.len(), old_path_table_len, "(w/ qualifiers)path table len mismatch");
