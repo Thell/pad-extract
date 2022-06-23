@@ -44,7 +44,7 @@ fn block_range(
 
 #[derive(Debug)]
 pub struct MetaFile {
-    ice: Ice,
+    pub ice: Ice,
     pub root: PathBuf,
     pub version: u32,
     pub package_table: Vec<PackageRecord>,
