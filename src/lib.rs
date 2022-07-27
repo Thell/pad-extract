@@ -126,7 +126,17 @@ impl MetaFile {
             .for_each(|p| std::fs::create_dir_all(out_path.join(p)).expect("create dir failed"));
         self.meta_table
             .par_iter()
-            .for_each(|mr| self.extract(mr, level, out_path).expect("extract failed"));
+            .for_each(|mr| {
+                if let Err(e) = self.extract(mr, level, out_path) {
+                    let path = self.path_table[mr.path_id as usize].path.clone();
+                    let file = &self.file_table[mr.file_id as usize];
+                    let out_path = path.join(file);
+                    println!("Failed {}\n metarecord: {:?}\n with error: {}\n",
+                        out_path.display(),
+                        mr,
+                        e);
+                }
+            });
         Ok(())
     }
 
