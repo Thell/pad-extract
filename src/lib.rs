@@ -124,19 +124,19 @@ impl MetaFile {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .for_each(|p| std::fs::create_dir_all(out_path.join(p)).expect("create dir failed"));
-        self.meta_table
-            .par_iter()
-            .for_each(|mr| {
-                if let Err(e) = self.extract(mr, level, out_path) {
-                    let path = self.path_table[mr.path_id as usize].path.clone();
-                    let file = &self.file_table[mr.file_id as usize];
-                    let out_path = path.join(file);
-                    println!("Failed {}\n metarecord: {:?}\n with error: {}\n",
-                        out_path.display(),
-                        mr,
-                        e);
-                }
-            });
+        self.meta_table.par_iter().for_each(|mr| {
+            if let Err(e) = self.extract(mr, level, out_path) {
+                let path = self.path_table[mr.path_id as usize].path.clone();
+                let file = &self.file_table[mr.file_id as usize];
+                let out_path = path.join(file);
+                println!(
+                    "Failed {}\n metarecord: {:?}\n with error: {}\n",
+                    out_path.display(),
+                    mr,
+                    e
+                );
+            }
+        });
         Ok(())
     }
 
@@ -170,14 +170,18 @@ impl MetaFile {
         f.read_exact(&mut buf)?;
 
         let file_name = &self.file_table[record.file_id as usize];
-        if level >= &ReadLevel::Decrypt
-            && Some("dbss") != file_name.extension().and_then(std::ffi::OsStr::to_str)
-        {
+        let is_dbss = match file_name.to_str() {
+            Some(s) => s.ends_with(".dbss"),
+            None => false,
+        };
+        if level >= &ReadLevel::Decrypt && !is_dbss {
             self.ice.decrypt_par(&mut buf);
         }
 
         if level >= &ReadLevel::Decompress {
-            if record.sz_original > record.sz_compressed || (!buf.is_empty() && buf[0] == 0x6E) {
+            if record.sz_original > record.sz_compressed
+                || (!is_dbss && !buf.is_empty() && buf[0] == 0x6E)
+            {
                 let mut buf_reader = Cursor::<&[u8]>::new(&buf);
                 buf = quicklz::decompress(&mut buf_reader, record.sz_original)?;
             }
