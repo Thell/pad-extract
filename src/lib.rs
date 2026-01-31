@@ -175,11 +175,14 @@ impl MetaFile {
             None => false,
         };
         if level >= &ReadLevel::Decrypt && !is_dbss {
-            if buf.len() < 512 {
-                self.ice.decrypt(&mut buf);
-            } else {
-                self.ice.decrypt_par(&mut buf);
-            }
+            buf.par_chunks_exact_mut(128)
+                .for_each(|chunk| self.ice.decrypt_blocks_par::<16>(chunk));
+            buf.chunks_exact_mut(128)
+                .into_remainder()
+                .chunks_exact_mut(8)
+                .for_each(|chunk| {
+                    self.ice.decrypt(chunk);
+                });
         }
 
         if level >= &ReadLevel::Decompress {
