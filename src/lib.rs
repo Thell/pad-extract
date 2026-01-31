@@ -175,9 +175,9 @@ impl MetaFile {
             None => false,
         };
         if level >= &ReadLevel::Decrypt && !is_dbss {
-            buf.par_chunks_exact_mut(128)
-                .for_each(|chunk| self.ice.decrypt_blocks_par::<16>(chunk));
-            buf.chunks_exact_mut(128)
+            buf.par_chunks_exact_mut(64)
+                .for_each(|chunk| self.ice.decrypt_blocks_par::<8>(chunk));
+            buf.chunks_exact_mut(64)
                 .into_remainder()
                 .chunks_exact_mut(8)
                 .for_each(|chunk| {
