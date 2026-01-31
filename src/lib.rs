@@ -3,8 +3,8 @@ use byteorder::ReadBytesExt;
 use icefast::Ice;
 use rayon::prelude::*;
 use std::error::Error;
-use std::io::prelude::*;
 use std::io::Cursor;
+use std::io::prelude::*;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -175,7 +175,7 @@ impl MetaFile {
             None => false,
         };
         if level >= &ReadLevel::Decrypt && !is_dbss {
-            self.ice.decrypt_auto(&mut buf);
+            self.ice.decrypt_par(&mut buf);
         }
 
         if level >= &ReadLevel::Decompress {
