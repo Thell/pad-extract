@@ -175,7 +175,7 @@ impl MetaFile {
             None => false,
         };
         if level >= &ReadLevel::Decrypt && !is_dbss {
-            self.ice.decrypt_par(&mut buf);
+            self.ice.decrypt(&mut buf);
         }
 
         if level >= &ReadLevel::Decompress {
