@@ -1,4 +1,5 @@
 use mimalloc::MiMalloc;
+
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -90,11 +91,15 @@ fn b7_read_decompressed(bench: &mut Bencher) {
 
 fn b8_extract(bench: &mut Bencher) {
     bench.iter(|| {
-        let out = PathBuf::from("./").canonicalize().unwrap().join("bench-out");
+        let out = PathBuf::from("./")
+            .canonicalize()
+            .unwrap()
+            .join("bench-out");
         let mut meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         meta.filter_by_path(PATH_FILTER).expect("path filter error");
         meta.filter_by_file(FILE_FILTER).expect("path filter error");
-        meta.extract_many(&ReadLevel::Decompress, &out).expect("extract failed");
+        meta.extract_many(&ReadLevel::Decompress, &out)
+            .expect("extract failed");
     });
 }
 

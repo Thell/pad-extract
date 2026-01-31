@@ -1,6 +1,6 @@
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
-use ice::icefast::Ice;
+use icefast::Ice;
 use rayon::prelude::*;
 use std::error::Error;
 use std::io::prelude::*;
@@ -175,7 +175,7 @@ impl MetaFile {
             None => false,
         };
         if level >= &ReadLevel::Decrypt && !is_dbss {
-            self.ice.decrypt_par(&mut buf);
+            self.ice.decrypt_auto(&mut buf);
         }
 
         if level >= &ReadLevel::Decompress {
@@ -274,7 +274,7 @@ impl PathRecord {
     }
 
     fn many_from_encrypted_le_bytes(bytes: &mut [u8], ice: &Ice) -> Vec<PathRecord> {
-        ice.decrypt_par(bytes);
+        ice.decrypt_auto(bytes);
         let trimmed_len = bytes.len() - bytes.iter().rev().position(|x| *x != 0).unwrap() + 1;
         let bytes = &mut bytes[..trimmed_len];
 
@@ -300,7 +300,7 @@ impl PathRecord {
 struct FileRecord; // PathBuf
 impl FileRecord {
     fn many_from_encrypted_le_bytes(bytes: &mut [u8], ice: &Ice) -> Vec<PathBuf> {
-        ice.decrypt_par(bytes);
+        ice.decrypt_auto(bytes);
         let trimmed_len = bytes.len() - bytes.iter().rev().position(|x| x != &0u8).unwrap();
         bytes[..trimmed_len]
             .par_split(|x| x == &0u8)
