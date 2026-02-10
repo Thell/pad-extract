@@ -1,16 +1,19 @@
-use byteorder::LittleEndian;
-use byteorder::ReadBytesExt;
+use std::borrow::Cow;
+use std::error::Error;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
+use bytemuck::allocation::pod_collect_to_vec;
+use bytemuck::{Pod, Zeroable};
+use byteorder::{LittleEndian, ReadBytesExt};
+use encoding_rs::EUC_KR;
 use icefast::Ice;
 use rayon::prelude::*;
-use std::error::Error;
-use std::io::Cursor;
-use std::io::prelude::*;
-use std::path::Path;
-use std::path::PathBuf;
+use rdst::{RadixKey, RadixSort};
 
 #[derive(PartialOrd, Ord, PartialEq, Eq)]
 pub enum ReadLevel {
-    #[allow(dead_code)]
     Raw,
     Decrypt,
     Decompress,
@@ -25,8 +28,8 @@ enum BlockType {
 
 fn block_range(
     block: BlockType,
-    reader: &mut Cursor<&mut Vec<u8>>,
-) -> Result<std::ops::Range<usize>, Box<dyn Error>> {
+    reader: &mut Cursor<&mut [u8]>,
+) -> Result<Range<usize>, Box<dyn Error>> {
     let count = reader.read_u32::<LittleEndian>()? as u64;
     let start = reader.position();
     let end = match block {
@@ -36,197 +39,19 @@ fn block_range(
         BlockType::Files => start + count,
     };
     reader.set_position(end);
-    Ok(std::ops::Range {
-        start: start as usize,
-        end: end as usize,
-    })
+    Ok(start as usize..end as usize)
 }
 
-#[derive(Debug)]
-pub struct MetaFile {
-    pub ice: Ice,
-    pub root: PathBuf,
-    pub version: u32,
-    pub package_table: Vec<PackageRecord>,
-    pub meta_table: Vec<MetaRecord>,
-    pub path_table: Vec<PathRecord>,
-    pub file_table: Vec<PathBuf>,
-}
-
-impl MetaFile {
-    // The path table is organized such that each entry is a bucket of file indices.
-    // The raw data is organized for hash lookups, but this library organizes it for
-    // efficient filtering and extraction directly using the path table bucket indices
-    // on the meta table records.
-    // In order to filter by bucket indices the meta table needs to be sorted by file index.
-    pub fn new(buf: &mut Vec<u8>, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
-        let ice = Ice::new(0, key);
-        let root = PathBuf::new();
-
-        let mut reader = Cursor::new(&mut *buf);
-
-        let version = reader.read_u32::<LittleEndian>().unwrap();
-
-        let range = block_range(BlockType::Packages, &mut reader)?;
-        let package_table = PackageRecord::many_from_le_bytes(&reader.get_ref()[range]);
-
-        let range = block_range(BlockType::Metas, &mut reader)?;
-        let mut meta_table = MetaRecord::many_from_le_bytes(&reader.get_ref()[range]);
-        meta_table.par_sort_by_key(|x| x.file_id);
-
-        let range = block_range(BlockType::Paths, &mut reader)?;
-        let path_table =
-            PathRecord::many_from_encrypted_le_bytes(&mut reader.get_mut()[range], &ice);
-
-        let range = block_range(BlockType::Files, &mut reader)?;
-        let file_table =
-            FileRecord::many_from_encrypted_le_bytes(&mut reader.get_mut()[range], &ice);
-
-        let meta_file = MetaFile {
-            ice,
-            root,
-            version,
-            package_table,
-            meta_table,
-            path_table,
-            file_table,
-        };
-        Ok(meta_file)
-    }
-
-    pub fn new_from_path(root: &Path, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
-        let metafile = PathBuf::from("pad00000.meta");
-        let mut buf = std::fs::read(root.join(metafile))?;
-        let mut meta = Self::new(&mut buf, key)?;
-        meta.root = root.to_path_buf();
-        Ok(meta)
-    }
-
-    pub fn extract(
-        &self,
-        record: &MetaRecord,
-        level: &ReadLevel,
-        out_path: &Path,
-    ) -> Result<(), Box<dyn Error>> {
-        let file_path = self.path_table[record.path_id as usize].path.clone();
-        let file_name = &self.file_table[record.file_id as usize];
-        let out_path = &out_path.join(file_path).join(file_name);
-        let mut f = std::fs::File::create(out_path)?;
-        let buf = &self.read(record, level)?;
-        f.write_all(buf)?;
-        Ok(())
-    }
-
-    pub fn extract_many(&self, level: &ReadLevel, out_path: &Path) -> Result<(), Box<dyn Error>> {
-        self.meta_table
-            .iter()
-            .map(|mr| self.path_table[mr.path_id as usize].path.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .for_each(|p| std::fs::create_dir_all(out_path.join(p)).expect("create dir failed"));
-        self.meta_table.par_iter().for_each(|mr| {
-            if let Err(e) = self.extract(mr, level, out_path) {
-                let path = self.path_table[mr.path_id as usize].path.clone();
-                let file = &self.file_table[mr.file_id as usize];
-                let out_path = path.join(file);
-                println!(
-                    "Failed {}\n metarecord: {:?}\n with error: {}\n",
-                    out_path.display(),
-                    mr,
-                    e
-                );
-            }
-        });
-        Ok(())
-    }
-
-    pub fn filter_by_file(&mut self, pattern: &str) -> Result<(), Box<dyn Error>> {
-        let re = regex::Regex::new(pattern).unwrap();
-        self.meta_table = self
-            .meta_table
-            .par_iter()
-            .filter(|x| re.is_match(self.file_table[x.file_id as usize].to_str().unwrap()))
-            .cloned()
-            .collect();
-        Ok(())
-    }
-
-    pub fn filter_by_path(&mut self, re_pat: &str) -> Result<(), Box<dyn Error>> {
-        let re = regex::Regex::new(re_pat).unwrap();
-        self.meta_table = self
-            .path_table
-            .iter()
-            .filter(|x| re.is_match(x.path.to_str().unwrap()))
-            .flat_map(|pr| self.meta_table[pr.file_range.clone()].to_vec())
-            .collect();
-        Ok(())
-    }
-
-    pub fn read(&self, record: &MetaRecord, level: &ReadLevel) -> Result<Vec<u8>, Box<dyn Error>> {
-        // ReadLevel::Raw
-        let mut f = std::fs::File::open(self.package_path(record))?;
-        f.seek(std::io::SeekFrom::Start(record.package_offset as u64))?;
-        let mut buf = vec![0; record.sz_compressed as usize];
-        f.read_exact(&mut buf)?;
-
-        let file_name = &self.file_table[record.file_id as usize];
-        let is_dbss = match file_name.to_str() {
-            Some(s) => s.ends_with(".dbss"),
-            None => false,
-        };
-        if level >= &ReadLevel::Decrypt && !is_dbss && !buf.is_empty() {
-            self.ice.decrypt_auto(&mut buf);
-        }
-
-        if level >= &ReadLevel::Decompress {
-            if record.sz_original > record.sz_compressed
-                || (!is_dbss && !buf.is_empty() && buf[0] == 0x6E)
-            {
-                let mut buf_reader = Cursor::<&[u8]>::new(&buf);
-                buf = quicklz::decompress(&mut buf_reader, record.sz_original)?;
-            }
-            if record.sz_original < record.sz_compressed {
-                buf = buf[0..record.sz_original as usize].to_vec();
-            }
-        }
-        Ok(buf)
-    }
-
-    pub fn package_name(&self, record: &MetaRecord) -> PathBuf {
-        PathBuf::from(format!("PAD{:05}.paz", record.package_id))
-    }
-
-    pub fn package_path(&self, record: &MetaRecord) -> PathBuf {
-        self.root.join(self.package_name(record))
-    }
-}
-
-#[derive(Debug)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct PackageRecord {
     pub id: u32,
     pub hash: u32,
     pub size: u32,
 }
 
-impl PackageRecord {
-    fn from_le_bytes(bytes: [u8; 12]) -> PackageRecord {
-        let mut reader = Cursor::new(bytes);
-        PackageRecord {
-            id: reader.read_u32::<LittleEndian>().unwrap(),
-            hash: reader.read_u32::<LittleEndian>().unwrap(),
-            size: reader.read_u32::<LittleEndian>().unwrap(),
-        }
-    }
-
-    fn many_from_le_bytes(bytes: &[u8]) -> Vec<PackageRecord> {
-        bytes
-            .par_chunks_exact(12)
-            .map(|chunk| PackageRecord::from_le_bytes(chunk.try_into().unwrap()))
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct MetaRecord {
     pub hash: u32,
     pub path_id: u32,
@@ -237,75 +62,391 @@ pub struct MetaRecord {
     pub sz_original: u32,
 }
 
-impl MetaRecord {
-    fn from_le_bytes(bytes: &[u8; 28]) -> MetaRecord {
-        let mut reader = Cursor::new(bytes);
-        MetaRecord {
-            hash: reader.read_u32::<LittleEndian>().unwrap(),
-            path_id: reader.read_u32::<LittleEndian>().unwrap(),
-            file_id: reader.read_u32::<LittleEndian>().unwrap(),
-            package_id: reader.read_u32::<LittleEndian>().unwrap(),
-            package_offset: reader.read_u32::<LittleEndian>().unwrap(),
-            sz_compressed: reader.read_u32::<LittleEndian>().unwrap(),
-            sz_original: reader.read_u32::<LittleEndian>().unwrap(),
-        }
-    }
+impl RadixKey for MetaRecord {
+    // 4 levels for a u32 (4 bytes)
+    const LEVELS: usize = 4;
 
-    fn many_from_le_bytes(bytes: &[u8]) -> Vec<MetaRecord> {
-        bytes
-            .par_chunks_exact(28)
-            .map(|chunk| MetaRecord::from_le_bytes(chunk.try_into().unwrap()))
-            .collect()
+    #[inline]
+    fn get_level(&self, level: usize) -> u8 {
+        // This extracts each byte of the u32 for the radix passes
+        // level 0 is the least significant byte, level 3 is the most
+        (self.file_id >> (level * 8)) as u8
     }
 }
 
 #[derive(Debug)]
-pub struct PathRecord {
-    pub path: PathBuf,
-    pub file_range: std::ops::Range<usize>,
+pub struct PathRecord<'a> {
+    pub path: Cow<'a, str>,
+    pub file_range: Range<usize>,
 }
 
-impl PathRecord {
-    fn from_raw_parts(path: &str, start: usize, end: usize) -> PathRecord {
-        PathRecord {
-            path: PathBuf::from(path),
-            file_range: std::ops::Range { start, end },
-        }
-    }
-
-    fn many_from_encrypted_le_bytes(bytes: &mut [u8], ice: &Ice) -> Vec<PathRecord> {
+impl<'a> PathRecord<'a> {
+    fn many_from_encrypted_le_bytes(bytes: &'a mut [u8], ice: &Ice) -> Vec<PathRecord<'a>> {
         ice.decrypt_auto(bytes);
-        let trimmed_len = bytes.len() - bytes.iter().rev().position(|x| *x != 0).unwrap() + 1;
+
+        let trimmed_len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        let bytes = &bytes[..trimmed_len];
+
+        let mut out = Vec::with_capacity(8192);
+        let mut pos = 0;
+
+        while pos + 8 < bytes.len() {
+            let start = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
+            pos += 8;
+
+            let remaining = &bytes[pos..];
+            let end = remaining
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(remaining.len());
+
+            let path_bytes = &bytes[pos..pos + end];
+
+            // SAFETY: All paths in the meta file are valid ASCII. If this ever changes the
+            //         paths themselves will still be valid UTF-8 and only the presentation
+            //         of those instances will be wrong. They will still be filterable using
+            //         non-EUC_KR UTF characters.
+            let path_str = unsafe { std::str::from_utf8_unchecked(path_bytes) };
+
+            out.push(PathRecord {
+                path: Cow::Borrowed(path_str),
+                file_range: start as usize..(start + len) as usize,
+            });
+
+            pos += end + 1;
+        }
+        out
+    }
+}
+
+struct FileRecord;
+
+impl FileRecord {
+    fn many_from_encrypted_le_bytes<'a>(bytes: &'a mut [u8], ice: &Ice) -> Vec<&'a str> {
+        ice.decrypt_auto(bytes);
+        let trimmed_len = bytes.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
         let bytes = &mut bytes[..trimmed_len];
 
-        let mut path_table = Vec::new();
-        let mut reader = Cursor::new(bytes);
-        while (reader.position() as usize) < trimmed_len {
-            let start = reader.read_u32::<LittleEndian>().unwrap();
-            let end = start + reader.read_u32::<LittleEndian>().unwrap();
-            let mut buf = Vec::new();
-            reader.read_until(0, &mut buf).unwrap();
-            buf.pop();
-            let record = PathRecord::from_raw_parts(
-                &encoding_rs::EUC_KR.decode_without_bom_handling(&buf).0,
-                start as usize,
-                end as usize,
-            );
-            path_table.push(record);
-        }
-        path_table
+        // NOTE: Less than 0.005% of the bytes are non-ASCII.
+        // We can decode those rare cases into a leaked string
+        // to maintain the &'a str return type.
+        bytes
+            .par_split(|&x| x == 0)
+            .map(|chunk| {
+                if encoding_rs::mem::is_ascii(chunk) {
+                    // SAFETY: We just ensured all bytes are ASCII
+                    unsafe { std::str::from_utf8_unchecked(chunk) }
+                } else {
+                    let cow_str = EUC_KR.decode_without_bom_handling(chunk).0;
+                    Box::leak(cow_str.into_owned().into_boxed_str())
+                }
+            })
+            .collect()
     }
 }
 
-struct FileRecord; // PathBuf
-impl FileRecord {
-    fn many_from_encrypted_le_bytes(bytes: &mut [u8], ice: &Ice) -> Vec<PathBuf> {
-        ice.decrypt_auto(bytes);
-        let trimmed_len = bytes.len() - bytes.iter().rev().position(|x| x != &0u8).unwrap();
-        bytes[..trimmed_len]
-            .par_split(|x| x == &0u8)
-            .map(|x| encoding_rs::EUC_KR.decode_without_bom_handling(x).0)
-            .map(|x| PathBuf::from(x.to_string()))
-            .collect()
+pub struct MetaFile {
+    #[allow(unused)]
+    buf: Vec<u8>, // backing storage str
+    pub ice: Ice,
+    pub root: PathBuf,
+    pub version: u32,
+    pub package_table: Vec<PackageRecord>,
+    pub meta_table: Vec<MetaRecord>,
+    pub path_table: Vec<PathRecord<'static>>,
+    pub file_table: Vec<&'static str>,
+}
+
+impl MetaFile {
+    // The path table is organized such that each entry is a bucket of file indices.
+    // The raw data is organized for hash lookups, but this library organizes it for
+    // efficient filtering and extraction directly using the path table bucket indices
+    // on the meta table records.
+    // **In order to filter by bucket indices the meta table must be sorted by file index.**
+    pub fn new(mut buf: Vec<u8>, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
+        let ice = Ice::new(0, key);
+        let root = PathBuf::new();
+
+        let mut reader = Cursor::new(buf.as_mut_slice());
+        let version = reader.read_u32::<LittleEndian>()?;
+        let range_packages = block_range(BlockType::Packages, &mut reader)?;
+        let range_metas = block_range(BlockType::Metas, &mut reader)?;
+        let range_paths = block_range(BlockType::Paths, &mut reader)?;
+        let range_files = block_range(BlockType::Files, &mut reader)?;
+
+        drop(reader);
+
+        // SAFETY: We just extracted the ranges, so we know that the ranges are valid
+        //         unless the source material changes format in which case the whole
+        //         extractor will fail.
+
+        let (packages_slice, meta_slice, paths_slice, files_slice) = unsafe {
+            let base = buf.as_mut_ptr();
+            (
+                std::slice::from_raw_parts_mut(
+                    base.add(range_packages.start),
+                    range_packages.len(),
+                ),
+                std::slice::from_raw_parts_mut(base.add(range_metas.start), range_metas.len()),
+                std::slice::from_raw_parts_mut(base.add(range_paths.start), range_paths.len()),
+                std::slice::from_raw_parts_mut(base.add(range_files.start), range_files.len()),
+            )
+        };
+
+        let package_table: Vec<PackageRecord> = pod_collect_to_vec(packages_slice);
+        let mut meta_table: Vec<MetaRecord> = pod_collect_to_vec(meta_slice);
+        let path_table = PathRecord::many_from_encrypted_le_bytes(paths_slice, &ice);
+        let file_table = FileRecord::many_from_encrypted_le_bytes(files_slice, &ice);
+
+        meta_table.radix_sort_unstable();
+
+        return Ok(MetaFile {
+            buf,
+            ice,
+            root,
+            version,
+            package_table,
+            meta_table,
+            path_table,
+            file_table,
+        });
+    }
+
+    // pub fn new(mut buf: Vec<u8>, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
+    //     let start_total = std::time::Instant::now();
+
+    //     let ice = Ice::new(0, key);
+    //     let root = PathBuf::new();
+
+    //     let start_load = std::time::Instant::now();
+    //     let mut reader = Cursor::new(buf.as_mut_slice());
+    //     let version = reader.read_u32::<LittleEndian>()?;
+    //     let range_packages = block_range(BlockType::Packages, &mut reader)?;
+    //     let range_metas = block_range(BlockType::Metas, &mut reader)?;
+    //     let range_paths = block_range(BlockType::Paths, &mut reader)?;
+    //     let range_files = block_range(BlockType::Files, &mut reader)?;
+    //     drop(reader);
+
+    //     // SAFETY: We just extracted the ranges, so we know that the ranges are valid
+    //     //         unless the source material changes format in which case the whole
+    //     //         extractor will fail.
+    //     let (packages_slice, meta_slice, paths_slice, files_slice) = unsafe {
+    //         let base = buf.as_mut_ptr();
+    //         (
+    //             std::slice::from_raw_parts_mut(
+    //                 base.add(range_packages.start),
+    //                 range_packages.len(),
+    //             ),
+    //             std::slice::from_raw_parts_mut(base.add(range_metas.start), range_metas.len()),
+    //             std::slice::from_raw_parts_mut(base.add(range_paths.start), range_paths.len()),
+    //             std::slice::from_raw_parts_mut(base.add(range_files.start), range_files.len()),
+    //         )
+    //     };
+
+    //     let dur_load = start_load.elapsed();
+
+    //     let start_pkgs = std::time::Instant::now();
+    //     let package_table: Vec<PackageRecord> = pod_collect_to_vec(packages_slice);
+    //     let dur_pkgs = start_pkgs.elapsed();
+
+    //     let start_metas = std::time::Instant::now();
+    //     let mut meta_table: Vec<MetaRecord> = pod_collect_to_vec(meta_slice);
+    //     let dur_metas = start_metas.elapsed();
+
+    //     let start_paths = std::time::Instant::now();
+    //     let path_table = PathRecord::many_from_encrypted_le_bytes(paths_slice, &ice);
+    //     let dur_paths = start_paths.elapsed();
+
+    //     let start_files = std::time::Instant::now();
+    //     let file_table = FileRecord::many_from_encrypted_le_bytes(files_slice, &ice);
+    //     let dur_files = start_files.elapsed();
+
+    //     let start_sort = std::time::Instant::now();
+    //     meta_table.radix_sort_unstable();
+    //     let dur_sort = start_sort.elapsed();
+
+    //     let dur_total = start_total.elapsed();
+
+    //     println!(
+    //         "\nParse timings (ns): total={:.1}, load={:.1}, packages-parse ({})={:.1}, metas-parse ({})={:.1}, metas-sort={:.1}, paths-parse ({})={:.1}, files-parse ({})={:.1}",
+    //         dur_total.as_nanos() as f64 / 1000.0,
+    //         dur_load.as_nanos() as f64 / 1000.0,
+    //         package_table.len(),
+    //         dur_pkgs.as_nanos() as f64 / 1000.0,
+    //         meta_table.len(),
+    //         dur_metas.as_nanos() as f64 / 1000.0,
+    //         dur_sort.as_nanos() as f64 / 1000.0,
+    //         path_table.len(),
+    //         dur_paths.as_nanos() as f64 / 1000.0,
+    //         file_table.len(),
+    //         dur_files.as_nanos() as f64 / 1000.0,
+    //     );
+
+    //     return Ok(MetaFile {
+    //         buf,
+    //         ice,
+    //         root,
+    //         version,
+    //         package_table,
+    //         meta_table,
+    //         path_table,
+    //         file_table,
+    //     });
+    // }
+
+    pub fn new_from_path(root: &Path, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
+        let metafile = PathBuf::from("pad00000.meta");
+        let buf = std::fs::read(root.join(metafile))?;
+        let mut meta = Self::new(buf, key)?;
+        meta.root = root.to_path_buf();
+        Ok(meta)
+    }
+
+    pub fn extract(
+        &self,
+        record: &MetaRecord,
+        level: &ReadLevel,
+        out_path: &Path,
+    ) -> Result<(), Box<dyn Error>> {
+        let dir = self.path_table[record.path_id as usize].path.as_ref();
+        let file = self.file_table[record.file_id as usize];
+        let out = out_path.join(dir).join(file);
+
+        let mut f = std::fs::File::create(out)?;
+        let buf = self.read(record, level)?;
+        f.write_all(&buf)?;
+        Ok(())
+    }
+
+    pub fn extract_many(&self, level: &ReadLevel, out_path: &Path) -> Result<(), Box<dyn Error>> {
+        self.meta_table
+            .iter()
+            .map(|mr| self.path_table[mr.path_id as usize].path.as_ref())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .for_each(|p| std::fs::create_dir_all(out_path.join(p)).unwrap());
+
+        // Reuse the thead-safe scratch buffer for decompression
+        self.meta_table.par_iter().for_each_init(
+            || Vec::with_capacity(1024 * 1024),
+            |scratch, mr| {
+                if let Err(e) = self.extract_with_buffer(mr, level, out_path, scratch) {
+                    let p = self.path_table[mr.path_id as usize].path.as_ref();
+                    let f = self.file_table[mr.file_id as usize];
+                    eprintln!("Failed {}/{}: {}", p, f, e);
+                }
+            },
+        );
+
+        Ok(())
+    }
+
+    fn extract_with_buffer(
+        &self,
+        record: &MetaRecord,
+        level: &ReadLevel,
+        out_path: &Path,
+        scratch: &mut Vec<u8>,
+    ) -> Result<(), Box<dyn Error>> {
+        let dir = self.path_table[record.path_id as usize].path.as_ref();
+        let file = self.file_table[record.file_id as usize];
+        let out = out_path.join(dir).join(file);
+
+        self.read_into(record, level, scratch)?;
+        std::fs::write(out, scratch)?;
+        Ok(())
+    }
+
+    fn read_into(
+        &self,
+        record: &MetaRecord,
+        level: &ReadLevel,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut f = std::fs::File::open(self.package_path(record))?;
+        f.seek(SeekFrom::Start(record.package_offset as u64))?;
+
+        buf.resize(record.sz_compressed as usize, 0);
+        f.read_exact(buf)?;
+
+        let file_name = self.file_table[record.file_id as usize];
+        let is_dbss = file_name.ends_with(".dbss");
+
+        if level >= &ReadLevel::Decrypt && !is_dbss {
+            self.ice.decrypt_auto(buf);
+        }
+
+        if level >= &ReadLevel::Decompress {
+            if record.sz_original > record.sz_compressed
+                || (!is_dbss && !buf.is_empty() && buf[0] == 0x6E)
+            {
+                let mut r = Cursor::new(&buf);
+                let decompressed = quicklz::decompress(&mut r, record.sz_original)?;
+                *buf = decompressed;
+            }
+            if record.sz_original < record.sz_compressed {
+                buf.truncate(record.sz_original as usize);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn read(&self, record: &MetaRecord, level: &ReadLevel) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut f = std::fs::File::open(self.package_path(record))?;
+        f.seek(SeekFrom::Start(record.package_offset as u64))?;
+        let mut buf = vec![0; record.sz_compressed as usize];
+        f.read_exact(&mut buf)?;
+
+        let file_name = self.file_table[record.file_id as usize];
+        let is_dbss = file_name.ends_with(".dbss");
+
+        if level >= &ReadLevel::Decrypt && !is_dbss {
+            self.ice.decrypt_auto(&mut buf);
+        }
+
+        if level >= &ReadLevel::Decompress {
+            if record.sz_original > record.sz_compressed
+                || (!is_dbss && !buf.is_empty() && buf[0] == 0x6E)
+            {
+                let mut r = Cursor::new(&buf);
+                buf = quicklz::decompress(&mut r, record.sz_original)?;
+            }
+            if record.sz_original < record.sz_compressed {
+                buf.truncate(record.sz_original as usize);
+            }
+        }
+
+        Ok(buf)
+    }
+
+    pub fn filter_by_file(&mut self, pattern: &str) -> Result<(), Box<dyn Error>> {
+        let re = regex::Regex::new(pattern).unwrap();
+        self.meta_table = self
+            .meta_table
+            .par_iter()
+            .filter(|x| re.is_match(self.file_table[x.file_id as usize].as_ref()))
+            .cloned()
+            .collect();
+        Ok(())
+    }
+
+    pub fn filter_by_path(&mut self, pattern: &str) -> Result<(), Box<dyn Error>> {
+        let re = regex::Regex::new(pattern).unwrap();
+        self.meta_table = self
+            .path_table
+            .par_iter()
+            .filter(|x| re.is_match(x.path.as_ref()))
+            .flat_map(|pr| self.meta_table[pr.file_range.clone()].to_vec())
+            .collect();
+        Ok(())
+    }
+
+    pub fn package_name(&self, record: &MetaRecord) -> PathBuf {
+        PathBuf::from(format!("PAD{:05}.paz", record.package_id))
+    }
+
+    pub fn package_path(&self, record: &MetaRecord) -> PathBuf {
+        self.root.join(self.package_name(record))
     }
 }
