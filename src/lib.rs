@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::error::Error;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use bytemuck::allocation::pod_collect_to_vec;
@@ -10,9 +11,58 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use encoding_rs::EUC_KR;
 use icefast::Ice;
 use memchr::memchr;
-use nohash_hasher::IntMap;
 use rayon::prelude::*;
 use rdst::{RadixKey, RadixSort};
+
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Storage::FileSystem::{
+    CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_WRITE,
+    FILE_SHARE_READ, WriteFile,
+};
+use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+
+struct OverlappedWorker {
+    // We keep two buffers. While one is "Locked" by the OS for a write,
+    // the other is "Active" for the next decompression.
+    buf_a: Vec<u8>,
+    buf_b: Vec<u8>,
+    is_a_active: bool,
+    pending_handle: HANDLE,
+    overlapped: OVERLAPPED,
+}
+
+impl OverlappedWorker {
+    fn new() -> Self {
+        Self {
+            buf_a: Vec::with_capacity(1024 * 1024),
+            buf_b: Vec::with_capacity(1024 * 1024),
+            is_a_active: true,
+            pending_handle: INVALID_HANDLE_VALUE,
+            overlapped: unsafe { std::mem::zeroed() },
+        }
+    }
+
+    /// Waits for the previous asynchronous write to finish and closes the handle.
+    fn wait_for_pending(&mut self) {
+        if self.pending_handle != INVALID_HANDLE_VALUE {
+            unsafe {
+                let mut transferred = 0;
+                // This blocks ONLY if the SSD hasn't finished the previous write yet.
+                // In most cases, the CPU is slower than the SSD's cache, so this returns instantly.
+                GetOverlappedResult(self.pending_handle, &self.overlapped, &mut transferred, 1);
+                CloseHandle(self.pending_handle);
+                self.pending_handle = INVALID_HANDLE_VALUE;
+            }
+        }
+    }
+}
+
+// Ensure handles are closed if a thread panics
+impl Drop for OverlappedWorker {
+    fn drop(&mut self) {
+        self.wait_for_pending();
+    }
+}
 
 #[derive(PartialOrd, Ord, PartialEq, Eq)]
 pub enum ReadLevel {
@@ -318,19 +368,9 @@ impl MetaFile {
         Ok(())
     }
 
-    pub fn extract_many(&self, level: &ReadLevel, out_path: &Path) -> Result<(), Box<dyn Error>> {
-        // self.meta_table
-        //     .iter()
-        //     .map(|mr| self.path_table[mr.path_id as usize].path.as_ref())
-        //     .collect::<std::collections::HashSet<_>>()
-        //     .into_iter()
-        //     .for_each(|dir| std::fs::create_dir_all(out_path.join(dir)).unwrap());
-
-        // 1. Pre-calculate joined paths for ONLY the directories present in the (filtered) meta_table
-        let mut path_cache: IntMap<u32, PathBuf> = IntMap::default();
-
+    fn build_path_cache(&self, out_path: &Path) -> nohash_hasher::IntMap<u32, PathBuf> {
+        let mut path_cache = nohash_hasher::IntMap::default();
         for mr in &self.meta_table {
-            // Entry API avoids re-calculating/re-joining for the same path_id
             path_cache.entry(mr.path_id).or_insert_with(|| {
                 let dir = self.path_table[mr.path_id as usize].path.as_ref();
                 let full_path = out_path.join(dir);
@@ -338,19 +378,79 @@ impl MetaFile {
                 full_path
             });
         }
+        path_cache
+    }
 
-        // Reuse the thead-safe scratch buffer for decompression
+    pub fn extract_many(&self, level: &ReadLevel, out_path: &Path) -> Result<(), Box<dyn Error>> {
+        // 1. Pre-calculate joined paths using your existing IntMap logic
+        let path_cache = self.build_path_cache(out_path);
+
+        // 2. Parallel extraction with Double-Buffered Overlapped I/O
         self.meta_table.par_iter().for_each_init(
-            || Vec::with_capacity(1024 * 1024),
-            |scratch, mr| {
+            || OverlappedWorker::new(),
+            |worker, mr| {
+                // A. Ensure the previous asynchronous write is finished before we reuse its buffer
+                worker.wait_for_pending();
+
+                // B. Toggle buffers (A -> B or B -> A)
+                worker.is_a_active = !worker.is_a_active;
+
+                // C. Perform the Read/Decrypt/Decompress.
+                // We scope this so 'current_buf' (the borrow of worker) is dropped before
+                // we update worker.pending_handle later.
+                let (data_ptr, data_len) = {
+                    let current_buf = if worker.is_a_active {
+                        &mut worker.buf_a
+                    } else {
+                        &mut worker.buf_b
+                    };
+                    if let Err(e) = self.read_into(mr, level, current_buf) {
+                        let p = self.path_table[mr.path_id as usize].path.as_ref();
+                        let f = self.file_table[mr.file_id as usize];
+                        eprintln!("Failed to read {}/{}: {}", p, f, e);
+                        return;
+                    }
+                    (current_buf.as_ptr(), current_buf.len() as u32)
+                };
+
+                // D. Prepare Windows Wide-String Path
                 let base_path = path_cache.get(&mr.path_id).unwrap();
                 let file_name = self.file_table[mr.file_id as usize];
-                let out = base_path.join(file_name);
+                let full_out = base_path.join(file_name);
+                let wide_path: Vec<u16> =
+                    full_out.as_os_str().encode_wide().chain(Some(0)).collect();
 
-                if let Err(e) = self.extract_with_buffer(mr, level, &out, scratch) {
-                    let p = self.path_table[mr.path_id as usize].path.as_ref();
-                    let f = self.file_table[mr.file_id as usize];
-                    eprintln!("Failed {}/{}: {}", p, f, e);
+                // E. Fire the Overlapped Write
+                unsafe {
+                    let h = CreateFileW(
+                        wide_path.as_ptr(),
+                        FILE_GENERIC_WRITE,
+                        FILE_SHARE_READ,
+                        std::ptr::null(),
+                        CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                        std::ptr::null_mut(),
+                    );
+
+                    // On Windows, INVALID_HANDLE_VALUE is -1.
+                    if h != INVALID_HANDLE_VALUE as _ && !h.is_null() {
+                        worker.pending_handle = h;
+                        worker.overlapped = std::mem::zeroed();
+
+                        // Start the write. The OS will read from data_ptr in the background.
+                        // This returns immediately.
+                        WriteFile(
+                            h,
+                            data_ptr,
+                            data_len,
+                            std::ptr::null_mut(),
+                            &mut worker.overlapped,
+                        );
+                    } else {
+                        let p = self.path_table[mr.path_id as usize].path.as_ref();
+                        let f = self.file_table[mr.file_id as usize];
+                        eprintln!("Failed to create file {}/{}: Handle is invalid", p, f);
+                    }
                 }
             },
         );
@@ -358,17 +458,50 @@ impl MetaFile {
         Ok(())
     }
 
-    fn extract_with_buffer(
-        &self,
-        record: &MetaRecord,
-        level: &ReadLevel,
-        out: &Path,
-        scratch: &mut Vec<u8>,
-    ) -> Result<(), Box<dyn Error>> {
-        self.read_into(record, level, scratch)?;
-        std::fs::write(out, scratch)?;
-        Ok(())
-    }
+    // pub fn extract_many(&self, level: &ReadLevel, out_path: &Path) -> Result<(), Box<dyn Error>> {
+    //     // 1. Pre-calculate joined paths for ONLY the directories present in the (filtered) meta_table
+    //     let mut path_cache: IntMap<u32, PathBuf> = IntMap::default();
+
+    //     for mr in &self.meta_table {
+    //         // Entry API avoids re-calculating/re-joining for the same path_id
+    //         path_cache.entry(mr.path_id).or_insert_with(|| {
+    //             let dir = self.path_table[mr.path_id as usize].path.as_ref();
+    //             let full_path = out_path.join(dir);
+    //             let _ = std::fs::create_dir_all(&full_path);
+    //             full_path
+    //         });
+    //     }
+
+    //     // Reuse the thead-safe scratch buffer for decompression
+    //     self.meta_table.par_iter().for_each_init(
+    //         || Vec::with_capacity(1024 * 1024),
+    //         |scratch, mr| {
+    //             let base_path = path_cache.get(&mr.path_id).unwrap();
+    //             let file_name = self.file_table[mr.file_id as usize];
+    //             let out = base_path.join(file_name);
+
+    //             if let Err(e) = self.extract_with_buffer(mr, level, &out, scratch) {
+    //                 let p = self.path_table[mr.path_id as usize].path.as_ref();
+    //                 let f = self.file_table[mr.file_id as usize];
+    //                 eprintln!("Failed {}/{}: {}", p, f, e);
+    //             }
+    //         },
+    //     );
+
+    //     Ok(())
+    // }
+
+    // fn extract_with_buffer(
+    //     &self,
+    //     record: &MetaRecord,
+    //     level: &ReadLevel,
+    //     out: &Path,
+    //     scratch: &mut Vec<u8>,
+    // ) -> Result<(), Box<dyn Error>> {
+    //     self.read_into(record, level, scratch)?;
+    //     std::fs::write(out, scratch)?;
+    //     Ok(())
+    // }
 
     fn read_into(
         &self,
@@ -417,40 +550,6 @@ impl MetaFile {
         }
         Ok(())
     }
-
-    // fn read_into(
-    //     &self,
-    //     record: &MetaRecord,
-    //     level: &ReadLevel,
-    //     buf: &mut Vec<u8>,
-    // ) -> Result<(), Box<dyn Error>> {
-    //     let mut f = std::fs::File::open(self.package_path(record))?;
-    //     f.seek(SeekFrom::Start(record.package_offset as u64))?;
-
-    //     buf.resize(record.sz_compressed as usize, 0);
-    //     f.read_exact(buf)?;
-
-    //     let file_name = self.file_table[record.file_id as usize];
-    //     let is_dbss = file_name.ends_with(".dbss");
-
-    //     if level >= &ReadLevel::Decrypt && !is_dbss {
-    //         self.ice.decrypt_auto(buf);
-    //     }
-
-    //     if level >= &ReadLevel::Decompress {
-    //         if record.sz_original > record.sz_compressed
-    //             || (!is_dbss && !buf.is_empty() && buf[0] == 0x6E)
-    //         {
-    //             let mut r = Cursor::new(&buf);
-    //             let decompressed = quicklz::decompress(&mut r, record.sz_original)?;
-    //             *buf = decompressed;
-    //         }
-    //         if record.sz_original < record.sz_compressed {
-    //             buf.truncate(record.sz_original as usize);
-    //         }
-    //     }
-    //     Ok(())
-    // }
 
     pub fn read(&self, record: &MetaRecord, level: &ReadLevel) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut f = std::fs::File::open(self.package_path(record))?;
