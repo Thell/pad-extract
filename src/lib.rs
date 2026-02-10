@@ -9,6 +9,8 @@ use bytemuck::{Pod, Zeroable};
 use byteorder::{LittleEndian, ReadBytesExt};
 use encoding_rs::EUC_KR;
 use icefast::Ice;
+use memchr::memchr;
+use nohash_hasher::IntMap;
 use rayon::prelude::*;
 use rdst::{RadixKey, RadixSort};
 
@@ -84,37 +86,29 @@ impl<'a> PathRecord<'a> {
     fn many_from_encrypted_le_bytes(bytes: &'a mut [u8], ice: &Ice) -> Vec<PathRecord<'a>> {
         ice.decrypt_auto(bytes);
 
-        let trimmed_len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-        let bytes = &bytes[..trimmed_len];
+        // SAFETY: Since the path string list is of null terminated strings
+        //         we use +2 to account for the null terminator of the last string.
+        let trimmed_len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 2);
+        let mut bytes = &bytes[..trimmed_len];
 
         let mut out = Vec::with_capacity(8192);
-        let mut pos = 0;
 
-        while pos + 8 < bytes.len() {
-            let start = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-            let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
-            pos += 8;
+        // NOTE: There must be start (4), end (4), a path (1..), and a null terminator (1)
+        while bytes.len() >= 10 {
+            let (header, rest) = bytes.split_at(8);
 
-            let remaining = &bytes[pos..];
-            let end = remaining
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(remaining.len());
+            let start = u32::from_le_bytes(header[0..4].try_into().unwrap());
+            let len = u32::from_le_bytes(header[4..8].try_into().unwrap());
 
-            let path_bytes = &bytes[pos..pos + end];
-
-            // SAFETY: All paths in the meta file are valid ASCII. If this ever changes the
-            //         paths themselves will still be valid UTF-8 and only the presentation
-            //         of those instances will be wrong. They will still be filterable using
-            //         non-EUC_KR UTF characters.
-            let path_str = unsafe { std::str::from_utf8_unchecked(path_bytes) };
-
-            out.push(PathRecord {
-                path: Cow::Borrowed(path_str),
-                file_range: start as usize..(start + len) as usize,
-            });
-
-            pos += end + 1;
+            if let Some(end) = memchr(0, &rest) {
+                let (path_bytes, after_path) = rest.split_at(end);
+                let path_str = unsafe { std::str::from_utf8_unchecked(path_bytes) };
+                out.push(PathRecord {
+                    path: Cow::Borrowed(path_str),
+                    file_range: start as usize..(start + len) as usize,
+                });
+                bytes = &after_path[1..];
+            }
         }
         out
     }
@@ -125,6 +119,11 @@ struct FileRecord;
 impl FileRecord {
     fn many_from_encrypted_le_bytes<'a>(bytes: &'a mut [u8], ice: &Ice) -> Vec<&'a str> {
         ice.decrypt_auto(bytes);
+
+        // SAFETY: Since the path string list is of null terminated strings
+        //         we would use +2 to account for the null terminator of the
+        //         last string except that the split iterator will create an
+        //         empty string at the end.
         let trimmed_len = bytes.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
         let bytes = &mut bytes[..trimmed_len];
 
@@ -320,18 +319,35 @@ impl MetaFile {
     }
 
     pub fn extract_many(&self, level: &ReadLevel, out_path: &Path) -> Result<(), Box<dyn Error>> {
-        self.meta_table
-            .iter()
-            .map(|mr| self.path_table[mr.path_id as usize].path.as_ref())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .for_each(|p| std::fs::create_dir_all(out_path.join(p)).unwrap());
+        // self.meta_table
+        //     .iter()
+        //     .map(|mr| self.path_table[mr.path_id as usize].path.as_ref())
+        //     .collect::<std::collections::HashSet<_>>()
+        //     .into_iter()
+        //     .for_each(|dir| std::fs::create_dir_all(out_path.join(dir)).unwrap());
+
+        // 1. Pre-calculate joined paths for ONLY the directories present in the (filtered) meta_table
+        let mut path_cache: IntMap<u32, PathBuf> = IntMap::default();
+
+        for mr in &self.meta_table {
+            // Entry API avoids re-calculating/re-joining for the same path_id
+            path_cache.entry(mr.path_id).or_insert_with(|| {
+                let dir = self.path_table[mr.path_id as usize].path.as_ref();
+                let full_path = out_path.join(dir);
+                let _ = std::fs::create_dir_all(&full_path);
+                full_path
+            });
+        }
 
         // Reuse the thead-safe scratch buffer for decompression
         self.meta_table.par_iter().for_each_init(
             || Vec::with_capacity(1024 * 1024),
             |scratch, mr| {
-                if let Err(e) = self.extract_with_buffer(mr, level, out_path, scratch) {
+                let base_path = path_cache.get(&mr.path_id).unwrap();
+                let file_name = self.file_table[mr.file_id as usize];
+                let out = base_path.join(file_name);
+
+                if let Err(e) = self.extract_with_buffer(mr, level, &out, scratch) {
                     let p = self.path_table[mr.path_id as usize].path.as_ref();
                     let f = self.file_table[mr.file_id as usize];
                     eprintln!("Failed {}/{}: {}", p, f, e);
@@ -346,13 +362,9 @@ impl MetaFile {
         &self,
         record: &MetaRecord,
         level: &ReadLevel,
-        out_path: &Path,
+        out: &Path,
         scratch: &mut Vec<u8>,
     ) -> Result<(), Box<dyn Error>> {
-        let dir = self.path_table[record.path_id as usize].path.as_ref();
-        let file = self.file_table[record.file_id as usize];
-        let out = out_path.join(dir).join(file);
-
         self.read_into(record, level, scratch)?;
         std::fs::write(out, scratch)?;
         Ok(())
@@ -367,13 +379,26 @@ impl MetaFile {
         let mut f = std::fs::File::open(self.package_path(record))?;
         f.seek(SeekFrom::Start(record.package_offset as u64))?;
 
-        buf.resize(record.sz_compressed as usize, 0);
+        let sz = record.sz_compressed as usize;
+        buf.clear();
+
+        // Check if the scratch buffer already has enough room to avoid reallocation.
+        if buf.capacity() < sz {
+            buf.reserve(sz);
+        }
+
+        // SAFETY: We are immediately following this with read_exact, which fills
+        // exactly 'sz' bytes. This avoids the zero-initialization cost of buf.resize(sz, 0).
+        // This is safe because u8 has no drop glue and the next operation is a total overwrite.
+        unsafe {
+            buf.set_len(sz);
+        }
         f.read_exact(buf)?;
 
         let file_name = self.file_table[record.file_id as usize];
         let is_dbss = file_name.ends_with(".dbss");
 
-        if level >= &ReadLevel::Decrypt && !is_dbss {
+        if level >= &ReadLevel::Decrypt && !is_dbss && !buf.is_empty() {
             self.ice.decrypt_auto(buf);
         }
 
@@ -382,15 +407,50 @@ impl MetaFile {
                 || (!is_dbss && !buf.is_empty() && buf[0] == 0x6E)
             {
                 let mut r = Cursor::new(&buf);
+                // quicklz allocates a new Vec; we transfer ownership to our scratch buffer.
                 let decompressed = quicklz::decompress(&mut r, record.sz_original)?;
                 *buf = decompressed;
             }
-            if record.sz_original < record.sz_compressed {
+            if (buf.len() as u32) > record.sz_original {
                 buf.truncate(record.sz_original as usize);
             }
         }
         Ok(())
     }
+
+    // fn read_into(
+    //     &self,
+    //     record: &MetaRecord,
+    //     level: &ReadLevel,
+    //     buf: &mut Vec<u8>,
+    // ) -> Result<(), Box<dyn Error>> {
+    //     let mut f = std::fs::File::open(self.package_path(record))?;
+    //     f.seek(SeekFrom::Start(record.package_offset as u64))?;
+
+    //     buf.resize(record.sz_compressed as usize, 0);
+    //     f.read_exact(buf)?;
+
+    //     let file_name = self.file_table[record.file_id as usize];
+    //     let is_dbss = file_name.ends_with(".dbss");
+
+    //     if level >= &ReadLevel::Decrypt && !is_dbss {
+    //         self.ice.decrypt_auto(buf);
+    //     }
+
+    //     if level >= &ReadLevel::Decompress {
+    //         if record.sz_original > record.sz_compressed
+    //             || (!is_dbss && !buf.is_empty() && buf[0] == 0x6E)
+    //         {
+    //             let mut r = Cursor::new(&buf);
+    //             let decompressed = quicklz::decompress(&mut r, record.sz_original)?;
+    //             *buf = decompressed;
+    //         }
+    //         if record.sz_original < record.sz_compressed {
+    //             buf.truncate(record.sz_original as usize);
+    //         }
+    //     }
+    //     Ok(())
+    // }
 
     pub fn read(&self, record: &MetaRecord, level: &ReadLevel) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut f = std::fs::File::open(self.package_path(record))?;
