@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::error::Error;
+use std::hash::BuildHasherDefault;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -100,7 +101,7 @@ impl<'a> PathRecord<'a> {
             let start = u32::from_le_bytes(header[0..4].try_into().unwrap());
             let len = u32::from_le_bytes(header[4..8].try_into().unwrap());
 
-            if let Some(end) = memchr(0, &rest) {
+            if let Some(end) = memchr(0, rest) {
                 let (path_bytes, after_path) = rest.split_at(end);
                 let path_str = unsafe { std::str::from_utf8_unchecked(path_bytes) };
                 out.push(PathRecord {
@@ -174,12 +175,9 @@ impl MetaFile {
         let range_paths = block_range(BlockType::Paths, &mut reader)?;
         let range_files = block_range(BlockType::Files, &mut reader)?;
 
-        drop(reader);
-
         // SAFETY: We just extracted the ranges, so we know that the ranges are valid
         //         unless the source material changes format in which case the whole
         //         extractor will fail.
-
         let (packages_slice, meta_slice, paths_slice, files_slice) = unsafe {
             let base = buf.as_mut_ptr();
             (
@@ -200,7 +198,7 @@ impl MetaFile {
 
         meta_table.radix_sort_unstable();
 
-        return Ok(MetaFile {
+        Ok(MetaFile {
             buf,
             ice,
             root,
@@ -209,7 +207,7 @@ impl MetaFile {
             meta_table,
             path_table,
             file_table,
-        });
+        })
     }
 
     // pub fn new(mut buf: Vec<u8>, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
@@ -318,19 +316,38 @@ impl MetaFile {
         Ok(())
     }
 
+    pub fn read(&self, record: &MetaRecord, level: &ReadLevel) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut f = std::fs::File::open(self.package_path(record))?;
+        f.seek(SeekFrom::Start(record.package_offset as u64))?;
+        let mut buf = vec![0; record.sz_compressed as usize];
+        f.read_exact(&mut buf)?;
+
+        let file_name = self.file_table[record.file_id as usize];
+        let is_dbss = file_name.ends_with(".dbss");
+
+        if level >= &ReadLevel::Decrypt && !is_dbss {
+            self.ice.decrypt_auto(&mut buf);
+        }
+
+        if level >= &ReadLevel::Decompress {
+            if record.sz_original > record.sz_compressed
+                || (!is_dbss && !buf.is_empty() && buf[0] == 0x6E)
+            {
+                let mut r = Cursor::new(&buf);
+                buf = quicklz::decompress(&mut r, record.sz_original)?;
+            }
+            if record.sz_original < record.sz_compressed {
+                buf.truncate(record.sz_original as usize);
+            }
+        }
+
+        Ok(buf)
+    }
+
     pub fn extract_many(&self, level: &ReadLevel, out_path: &Path) -> Result<(), Box<dyn Error>> {
-        // self.meta_table
-        //     .iter()
-        //     .map(|mr| self.path_table[mr.path_id as usize].path.as_ref())
-        //     .collect::<std::collections::HashSet<_>>()
-        //     .into_iter()
-        //     .for_each(|dir| std::fs::create_dir_all(out_path.join(dir)).unwrap());
-
-        // 1. Pre-calculate joined paths for ONLY the directories present in the (filtered) meta_table
-        let mut path_cache: IntMap<u32, PathBuf> = IntMap::default();
-
+        let mut path_cache: IntMap<u32, PathBuf> =
+            IntMap::with_capacity_and_hasher(self.meta_table.len(), BuildHasherDefault::default());
         for mr in &self.meta_table {
-            // Entry API avoids re-calculating/re-joining for the same path_id
             path_cache.entry(mr.path_id).or_insert_with(|| {
                 let dir = self.path_table[mr.path_id as usize].path.as_ref();
                 let full_path = out_path.join(dir);
@@ -339,7 +356,6 @@ impl MetaFile {
             });
         }
 
-        // Reuse the thead-safe scratch buffer for decompression
         self.meta_table.par_iter().for_each_init(
             || Vec::with_capacity(1024 * 1024),
             |scratch, mr| {
@@ -379,26 +395,25 @@ impl MetaFile {
         let mut f = std::fs::File::open(self.package_path(record))?;
         f.seek(SeekFrom::Start(record.package_offset as u64))?;
 
+        // SAFETY: Since we are immediately following this with read_exact, which fills
+        // exactly 'sz' bytes this avoids the zero-initialization cost of buf.resize(sz, 0).
+        // This is safe because u8 has no drop and the next operation is a total overwrite.
         let sz = record.sz_compressed as usize;
-        buf.clear();
-
-        // Check if the scratch buffer already has enough room to avoid reallocation.
         if buf.capacity() < sz {
             buf.reserve(sz);
         }
-
-        // SAFETY: We are immediately following this with read_exact, which fills
-        // exactly 'sz' bytes. This avoids the zero-initialization cost of buf.resize(sz, 0).
-        // This is safe because u8 has no drop glue and the next operation is a total overwrite.
         unsafe {
             buf.set_len(sz);
         }
         f.read_exact(buf)?;
+        if buf.is_empty() {
+            return Ok(());
+        }
 
         let file_name = self.file_table[record.file_id as usize];
         let is_dbss = file_name.ends_with(".dbss");
 
-        if level >= &ReadLevel::Decrypt && !is_dbss && !buf.is_empty() {
+        if level >= &ReadLevel::Decrypt && !is_dbss {
             self.ice.decrypt_auto(buf);
         }
 
@@ -416,68 +431,6 @@ impl MetaFile {
             }
         }
         Ok(())
-    }
-
-    // fn read_into(
-    //     &self,
-    //     record: &MetaRecord,
-    //     level: &ReadLevel,
-    //     buf: &mut Vec<u8>,
-    // ) -> Result<(), Box<dyn Error>> {
-    //     let mut f = std::fs::File::open(self.package_path(record))?;
-    //     f.seek(SeekFrom::Start(record.package_offset as u64))?;
-
-    //     buf.resize(record.sz_compressed as usize, 0);
-    //     f.read_exact(buf)?;
-
-    //     let file_name = self.file_table[record.file_id as usize];
-    //     let is_dbss = file_name.ends_with(".dbss");
-
-    //     if level >= &ReadLevel::Decrypt && !is_dbss {
-    //         self.ice.decrypt_auto(buf);
-    //     }
-
-    //     if level >= &ReadLevel::Decompress {
-    //         if record.sz_original > record.sz_compressed
-    //             || (!is_dbss && !buf.is_empty() && buf[0] == 0x6E)
-    //         {
-    //             let mut r = Cursor::new(&buf);
-    //             let decompressed = quicklz::decompress(&mut r, record.sz_original)?;
-    //             *buf = decompressed;
-    //         }
-    //         if record.sz_original < record.sz_compressed {
-    //             buf.truncate(record.sz_original as usize);
-    //         }
-    //     }
-    //     Ok(())
-    // }
-
-    pub fn read(&self, record: &MetaRecord, level: &ReadLevel) -> Result<Vec<u8>, Box<dyn Error>> {
-        let mut f = std::fs::File::open(self.package_path(record))?;
-        f.seek(SeekFrom::Start(record.package_offset as u64))?;
-        let mut buf = vec![0; record.sz_compressed as usize];
-        f.read_exact(&mut buf)?;
-
-        let file_name = self.file_table[record.file_id as usize];
-        let is_dbss = file_name.ends_with(".dbss");
-
-        if level >= &ReadLevel::Decrypt && !is_dbss {
-            self.ice.decrypt_auto(&mut buf);
-        }
-
-        if level >= &ReadLevel::Decompress {
-            if record.sz_original > record.sz_compressed
-                || (!is_dbss && !buf.is_empty() && buf[0] == 0x6E)
-            {
-                let mut r = Cursor::new(&buf);
-                buf = quicklz::decompress(&mut r, record.sz_original)?;
-            }
-            if record.sz_original < record.sz_compressed {
-                buf.truncate(record.sz_original as usize);
-            }
-        }
-
-        Ok(buf)
     }
 
     pub fn filter_by_file(&mut self, pattern: &str) -> Result<(), Box<dyn Error>> {
