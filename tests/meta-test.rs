@@ -17,8 +17,7 @@ fn meta_parse_instrumented() {
     for _ in 0..100 {
         // Clone the buffer so each iteration starts with a fresh,
         // identically-allocated slice for the decryption/parsing logic.
-        let mut test_buf = original_buf.clone();
-        let _ = MetaFile::new(&mut test_buf, KEY).expect("meta parsing error");
+        let _ = MetaFile::new(original_buf.clone(), KEY).expect("meta parsing error");
     }
     let duration = start.elapsed();
 
@@ -87,11 +86,7 @@ fn meta_parse() {
     assert_eq!(meta.path_table.len(), 6321, "path table len mismatch");
 
     let path_record = meta.path_table.first().unwrap();
-    assert_eq!(
-        path_record.path,
-        PathBuf::from("character/"),
-        "path mismatch"
-    );
+    assert_eq!(path_record.path, "character/", "path mismatch");
     assert_eq!(
         path_record.file_range.start, 0,
         "path bucket start mismatch"
@@ -100,8 +95,7 @@ fn meta_parse() {
 
     let path_record = meta.path_table.last().unwrap();
     assert_eq!(
-        path_record.path,
-        PathBuf::from("character/rebootbinaryactionchart/rebootpc/2_phw/"),
+        path_record.path, "character/rebootbinaryactionchart/rebootpc/2_phw/",
         "path mismatch"
     );
     assert_eq!(
@@ -116,13 +110,13 @@ fn meta_parse() {
     // File table
     assert_eq!(meta.file_table.len(), 597589, "file table len mismatch");
     assert_eq!(
-        meta.file_table.first().unwrap(),
-        &PathBuf::from("ai 스크립트_메뉴얼.xml"),
+        *meta.file_table.first().unwrap(),
+        "ai 스크립트_메뉴얼.xml",
         "file id mismatch"
     );
     assert_eq!(
-        meta.file_table.last().unwrap(),
-        &PathBuf::from("sorceressaction_noweapon_simple.paac"),
+        *meta.file_table.last().unwrap(),
+        "sorceressaction_noweapon_simple.paac",
         "file id mismatch"
     );
 }
@@ -139,8 +133,7 @@ fn path_filter() {
     let old_package_table_len = meta.package_table.len();
     let old_path_table_len = meta.path_table.len();
     let old_file_table_len = meta.file_table.len();
-    meta.filter_by_path("character")
-        .expect("(w/ qualifiers)path filter error");
+    meta.filter_by_path("character");
     assert_eq!(
         meta.package_table.len(),
         old_package_table_len,
@@ -164,8 +157,7 @@ fn path_filter() {
 
     // Filters with qualifiers.
     let mut meta = MetaFile::new_from_path(&ROOT, KEY).expect("meta parsing error");
-    meta.filter_by_path("^character/ai_.*k/")
-        .expect("(w/ qualifiers) path filter error");
+    meta.filter_by_path("^character/ai_.*k/");
     assert_eq!(
         meta.package_table.len(),
         old_package_table_len,
@@ -200,8 +192,7 @@ fn file_filter() {
     let old_package_table_len = meta.package_table.len();
     let old_path_table_len = meta.path_table.len();
     let old_file_table_len = meta.file_table.len();
-    meta.filter_by_file("cloud")
-        .expect("(w/ qualifiers)path filter error");
+    meta.filter_by_file("cloud");
     assert_eq!(
         meta.package_table.len(),
         old_package_table_len,
@@ -225,8 +216,7 @@ fn file_filter() {
 
     // Filters with qualifiers.
     let mut meta = MetaFile::new_from_path(&ROOT, KEY).expect("meta parsing error");
-    meta.filter_by_file("^cloud.*fx")
-        .expect("(w/ qualifiers) path filter error");
+    meta.filter_by_file("^cloud.*fx");
     assert_eq!(
         meta.package_table.len(),
         old_package_table_len,

@@ -1,24 +1,19 @@
 use std::error::Error;
 use std::io::prelude::*;
 use std::io::{Cursor, SeekFrom};
-use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 
-use bytemuck::allocation::pod_collect_to_vec;
-use bytemuck::{Pod, Zeroable};
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 use icefast::Ice;
-use nohash_hasher::{BuildNoHashHasher, IntMap};
 use rayon::prelude::*;
-use rdst::{RadixKey, RadixSort};
 
 /// The level of processing to use on the data to read from the archive.
 ///
-/// * `Raw` - The data is read but not decrypted or decompressed.
-/// * `Decrypt` - The data is read and decrypted.
-/// * `Decompress` - The data is read, decrypted and decompressed.
+/// * `Raw` - The data is not processed at all.
+/// * `Decrypt` - The data is decrypted.
+/// * `Decompress` - The data is decrypted and decompressed.
 #[derive(PartialOrd, Ord, PartialEq, Eq)]
 pub enum ReadLevel {
     #[allow(dead_code)]
@@ -41,9 +36,10 @@ enum BlockType {
 ///
 /// SAFETY: The meta data is a fixed format and the caller must ensure the cursor
 ///         is positioned at the start of the appropriate block.
+
 fn block_range(
     block: BlockType,
-    reader: &mut Cursor<&[u8]>,
+    reader: &mut Cursor<&mut Vec<u8>>,
 ) -> Result<std::ops::Range<usize>, Box<dyn Error>> {
     let count = reader.read_u32::<LittleEndian>()? as u64;
     let start = reader.position();
@@ -54,19 +50,39 @@ fn block_range(
         BlockType::Files => start + count,
     };
     reader.set_position(end);
-    Ok(start as usize..end as usize)
+    Ok(std::ops::Range {
+        start: start as usize,
+        end: end as usize,
+    })
 }
 
 /// NOTE: Package records are not used internally by this library.
 ///
 /// They can be utilized to validate the data archive or to differentiate
 /// packages across versions.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug)]
 pub struct PackageRecord {
     pub id: u32,
     pub hash: u32,
     pub size: u32,
+}
+
+impl PackageRecord {
+    fn from_le_bytes(bytes: [u8; 12]) -> PackageRecord {
+        let mut reader = Cursor::new(bytes);
+        PackageRecord {
+            id: reader.read_u32::<LittleEndian>().unwrap(),
+            hash: reader.read_u32::<LittleEndian>().unwrap(),
+            size: reader.read_u32::<LittleEndian>().unwrap(),
+        }
+    }
+
+    fn many_from_le_bytes(bytes: &[u8]) -> Vec<PackageRecord> {
+        bytes
+            .par_chunks_exact(12)
+            .map(|chunk| PackageRecord::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
 }
 
 /// A meta record contains the meta data for a specific file.
@@ -78,7 +94,7 @@ pub struct PackageRecord {
 /// path table, file table and package table respectively.
 ///
 /// sz_original accounts for both decryption and decompression.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MetaRecord {
     pub hash: u32,
     pub path_id: u32,
@@ -89,25 +105,7 @@ pub struct MetaRecord {
     pub sz_original: u32,
 }
 
-impl RadixKey for MetaRecord {
-    const LEVELS: usize = 4;
-
-    #[inline]
-    fn get_level(&self, level: usize) -> u8 {
-        // NOTE: We sort by file_id in order to facilitate an initial 1:1
-        //        path bucket range to file range index mapping for path filter.
-        (self.file_id >> (level * 8)) as u8
-    }
-}
-
 impl MetaRecord {
-    // NOTE: These compile down to almost the exact same code and similar runtimes.
-    //       The time comes down to the memcpy which can be elided using a pure zero-copy
-    //       approach that results in a slice, but then the sort is done which requires
-    //       copy anyway and the record handling during the extraction ends up having
-    //       a indirection and cache misses if an 'active_indices' map is used.
-    //
-    // A:
     fn from_le_bytes(bytes: &[u8; 28]) -> MetaRecord {
         let mut reader = Cursor::new(bytes);
         MetaRecord {
@@ -127,104 +125,87 @@ impl MetaRecord {
             .map(|chunk| MetaRecord::from_le_bytes(chunk.try_into().unwrap()))
             .collect()
     }
-
-    // // B:
-    // fn many_from_le_bytes(bytes: &[u8]) -> Vec<MetaRecord> {
-    //     bytes
-    //         .par_chunks_exact(28)
-    //         .map(|chunk| unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const MetaRecord) })
-    //         .collect()
-    // }
 }
 
 /// A path record consists of the path string and the range of file indices
 /// in that specific path's file bucket from the file table.
 #[derive(Debug)]
-pub struct PathRecord<'a> {
-    pub path: &'a str,
-    pub file_range: Range<usize>,
+pub struct PathRecord {
+    pub path: PathBuf,
+    pub file_range: std::ops::Range<usize>,
 }
 
-impl<'a> PathRecord<'a> {
-    fn many_from_encrypted_le_bytes(bytes: &'a [u8]) -> Vec<PathRecord<'a>> {
-        let mut out = Vec::with_capacity(8192);
-
-        // NOTE: There must be start (4), end (4), a path (1..), and a null terminator (1)
-        let mut pos = 0;
-        while pos < bytes.len() - 9 {
-            let bucket_start = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-            let bucket_len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
-            pos += 8;
-
-            if let Some(end) = memchr::memchr(0, &bytes[pos..]) {
-                // SAFETY: All path strings are ASCII
-                let path_str = unsafe { std::str::from_utf8_unchecked(&bytes[pos..pos + end]) };
-                pos += end + 1;
-                out.push(PathRecord {
-                    path: path_str,
-                    file_range: bucket_start as usize..(bucket_start + bucket_len) as usize,
-                });
-            }
+impl PathRecord {
+    fn from_raw_parts(path: &str, start: usize, end: usize) -> PathRecord {
+        PathRecord {
+            path: PathBuf::from(path),
+            file_range: std::ops::Range { start, end },
         }
-        out
+    }
+
+    fn many_from_encrypted_le_bytes(bytes: &mut [u8], ice: &Ice) -> Vec<PathRecord> {
+        ice.decrypt_auto(bytes);
+        let trimmed_len = bytes.len() - bytes.iter().rev().position(|x| *x != 0).unwrap() + 1;
+        let bytes = &mut bytes[..trimmed_len];
+
+        let mut path_table = Vec::new();
+        let mut reader = Cursor::new(bytes);
+        while (reader.position() as usize) < trimmed_len {
+            let start = reader.read_u32::<LittleEndian>().unwrap();
+            let end = start + reader.read_u32::<LittleEndian>().unwrap();
+            let mut buf = Vec::new();
+            reader.read_until(0, &mut buf).unwrap();
+            buf.pop();
+            let record = PathRecord::from_raw_parts(
+                &encoding_rs::EUC_KR.decode_without_bom_handling(&buf).0,
+                start as usize,
+                end as usize,
+            );
+            path_table.push(record);
+        }
+        path_table
     }
 }
 
-struct FileRecord;
-
+struct FileRecord; // PathBuf
 impl FileRecord {
-    fn many_from_encrypted_le_bytes(bytes: &[u8]) -> Vec<&str> {
-        let bytes = match bytes.iter().rposition(|&x| x != 0) {
-            Some(len) => &bytes[..=len],
-            None => return Vec::new(),
-        };
-
+    fn many_from_encrypted_le_bytes(bytes: &mut [u8], ice: &Ice) -> Vec<PathBuf> {
         // NOTE: Of the approximately 900,000 file names in the meta file less than 0.005%
         //       are invalid ASCII/UTF-8 that require decoding.
-        bytes
-            .par_split(|&b| b == 0)
-            .map(|chunk| {
-                // NOTE: std::slice is_ascii is slightly faster than encoding_rs is_ascii
-                if chunk.is_ascii() {
-                    // SAFETY: is_ascii ensures valid UTF-8 for the slice.
-                    unsafe { std::str::from_utf8_unchecked(chunk) }
-                } else {
-                    let cow_str = encoding_rs::EUC_KR.decode_without_bom_handling(chunk).0;
-                    Box::leak(cow_str.into_owned().into_boxed_str())
-                }
-            })
+
+        ice.decrypt_auto(bytes);
+        let trimmed_len = bytes.len() - bytes.iter().rev().position(|x| x != &0u8).unwrap();
+        bytes[..trimmed_len]
+            .par_split(|x| x == &0u8)
+            .map(|x| encoding_rs::EUC_KR.decode_without_bom_handling(x).0)
+            .map(|x| PathBuf::from(x.to_string()))
             .collect()
     }
 }
 
 #[derive(Debug)]
 pub struct MetaFile {
-    // SAFETY: This field must remain present and immutable for the lifetime of the struct,
-    //         as `path_table` and `file_table` contain slices that borrow directly.
-    #[allow(unused)]
-    buf: Vec<u8>,
-
     pub ice: Ice,
     pub root: PathBuf,
     pub version: u32,
     pub package_table: Vec<PackageRecord>,
     pub meta_table: Vec<MetaRecord>,
-    pub path_table: Vec<PathRecord<'static>>,
-    pub file_table: Vec<&'static str>,
+    pub path_table: Vec<PathRecord>,
+    pub file_table: Vec<PathBuf>,
 }
 
 impl MetaFile {
     /// Creates a new meta file from the root directory containing the `pad00000.meta` file
     /// and using the provided encryption key.
     ///
-    /// The `pad00000.meta`` path table is organized such that each path entry is a bucket
-    /// of file indices and is organized for hash lookups, but this library organizes it for
+    /// The `pad00000.meta`` path table is organized such that each entry is a bucket
+    /// of file indices nad is organized for hash lookups, but this library organizes it for
     /// efficient filtering and extraction by directly using the path table bucket indices
     /// on the meta table records.
     pub fn new_from_path(root: &Path, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
         let metafile = PathBuf::from("pad00000.meta");
-        let buf = std::fs::read(root.join(metafile))?;
-        let mut meta = Self::new(buf, key)?;
+        let mut buf = std::fs::read(root.join(metafile))?;
+        let mut meta = Self::new(&mut buf, key)?;
         meta.root = root.to_path_buf();
         Ok(meta)
     }
@@ -236,44 +217,31 @@ impl MetaFile {
     /// **SAFETY**: The pad00000.meta file is the source of truth.
     /// All unsafe operations are based on the assumption that the meta file is correct.
     #[cfg(not(feature = "instrumented"))]
-    pub fn new(mut buf: Vec<u8>, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
+    pub fn new(buf: &mut Vec<u8>, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
         // NOTE: ** To filter by bucket indices the meta table must be sorted by file index. **
         let ice = Ice::new(0, key);
         let root = PathBuf::new();
 
-        let mut reader = Cursor::new(buf.as_slice());
+        let mut reader = Cursor::new(&mut *buf);
 
         let version = reader.read_u32::<LittleEndian>().unwrap();
 
         let range = block_range(BlockType::Packages, &mut reader)?;
-        let package_table: Vec<PackageRecord> = pod_collect_to_vec(&reader.get_ref()[range]);
+        let package_table = PackageRecord::many_from_le_bytes(&reader.get_ref()[range]);
 
         let range = block_range(BlockType::Metas, &mut reader)?;
         let mut meta_table = MetaRecord::many_from_le_bytes(&reader.get_ref()[range]);
-        meta_table.radix_sort_unstable();
+        meta_table.par_sort_by_key(|x| x.file_id);
 
-        let range_paths = block_range(BlockType::Paths, &mut reader)?;
-        let range_files = block_range(BlockType::Files, &mut reader)?;
+        let range = block_range(BlockType::Paths, &mut reader)?;
+        let path_table =
+            PathRecord::many_from_encrypted_le_bytes(&mut reader.get_mut()[range], &ice);
 
-        // SAFETY: We just extracted the ranges, so we know that the ranges are valid
-        //         unless the source material changes format in which case the whole
-        //         extractor will fail.
-        let (paths_slice, files_slice) = unsafe {
-            let base = buf.as_mut_ptr();
-            (
-                std::slice::from_raw_parts_mut(base.add(range_paths.start), range_paths.len()),
-                std::slice::from_raw_parts_mut(base.add(range_files.start), range_files.len()),
-            )
-        };
-
-        ice.decrypt_auto(paths_slice);
-        let path_table = PathRecord::many_from_encrypted_le_bytes(paths_slice);
-
-        ice.decrypt_auto(files_slice);
-        let file_table = FileRecord::many_from_encrypted_le_bytes(files_slice);
+        let range = block_range(BlockType::Files, &mut reader)?;
+        let file_table =
+            FileRecord::many_from_encrypted_le_bytes(&mut reader.get_mut()[range], &ice);
 
         Ok(MetaFile {
-            buf,
             ice,
             root,
             version,
@@ -288,20 +256,20 @@ impl MetaFile {
     ///       `cargo test --release --features=instrumented -- --nocapture --test-threads=1`
     ///
     #[cfg(feature = "instrumented")]
-    pub fn new(mut buf: Vec<u8>, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
+    pub fn new(buf: &mut Vec<u8>, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
         // NOTE: ** To filter by bucket indices the meta table must be sorted by file index. **
         let start_total = std::time::Instant::now();
 
         let ice = Ice::new(0, key);
         let root = PathBuf::new();
 
-        let mut reader = Cursor::new(buf.as_slice());
+        let mut reader = Cursor::new(&mut *buf);
 
         let version = reader.read_u32::<LittleEndian>().unwrap();
 
         let start_pkgs = std::time::Instant::now();
         let range = block_range(BlockType::Packages, &mut reader)?;
-        let package_table: Vec<PackageRecord> = pod_collect_to_vec(&reader.get_ref()[range]);
+        let package_table = PackageRecord::many_from_le_bytes(&reader.get_ref()[range]);
         let dur_pkgs = start_pkgs.elapsed();
 
         let start_metas = std::time::Instant::now();
@@ -310,31 +278,19 @@ impl MetaFile {
         let dur_metas = start_metas.elapsed();
 
         let start_sort = std::time::Instant::now();
-        meta_table.radix_sort_unstable();
+        meta_table.par_sort_by_key(|x| x.file_id);
         let dur_sort = start_sort.elapsed();
 
-        let range_paths = block_range(BlockType::Paths, &mut reader)?;
-        let range_files = block_range(BlockType::Files, &mut reader)?;
-
-        // SAFETY: We just extracted the ranges, so we know that the ranges are valid
-        //         unless the source material changes format in which case the whole
-        //         extractor will fail.
-        let (paths_slice, files_slice) = unsafe {
-            let base = buf.as_mut_ptr();
-            (
-                std::slice::from_raw_parts_mut(base.add(range_paths.start), range_paths.len()),
-                std::slice::from_raw_parts_mut(base.add(range_files.start), range_files.len()),
-            )
-        };
-
         let start_paths = std::time::Instant::now();
-        ice.decrypt_auto(paths_slice);
-        let path_table = PathRecord::many_from_encrypted_le_bytes(paths_slice);
+        let range = block_range(BlockType::Paths, &mut reader)?;
+        let path_table =
+            PathRecord::many_from_encrypted_le_bytes(&mut reader.get_mut()[range], &ice);
         let dur_paths = start_paths.elapsed();
 
         let start_files = std::time::Instant::now();
-        ice.decrypt_auto(files_slice);
-        let file_table = FileRecord::many_from_encrypted_le_bytes(files_slice);
+        let range = block_range(BlockType::Files, &mut reader)?;
+        let file_table =
+            FileRecord::many_from_encrypted_le_bytes(&mut reader.get_mut()[range], &ice);
         let dur_files = start_files.elapsed();
 
         let dur_total = start_total.elapsed();
@@ -354,7 +310,6 @@ impl MetaFile {
         );
 
         Ok(MetaFile {
-            buf,
             ice,
             root,
             version,
@@ -372,7 +327,7 @@ impl MetaFile {
         level: &ReadLevel,
         out_path: &Path,
     ) -> Result<(), Box<dyn Error>> {
-        let dir = self.path_table[record.path_id as usize].path;
+        let dir = self.path_table[record.path_id as usize].path.clone();
         let file = &self.file_table[record.file_id as usize];
         let out = out_path.join(dir).join(file);
 
@@ -381,7 +336,7 @@ impl MetaFile {
         Ok(std::fs::write(out, buf)?)
     }
 
-    /// Reads and returns a single record from the archive.
+    /// Reads a single record from the archive.
     pub fn read(&self, record: &MetaRecord, level: &ReadLevel) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut f = std::fs::File::open(self.package_path(record))?;
         f.seek(SeekFrom::Start(record.package_offset as u64))?;
@@ -389,8 +344,10 @@ impl MetaFile {
         f.read_exact(&mut buf)?;
 
         let file_name = &self.file_table[record.file_id as usize];
-        let is_dbss = file_name.ends_with(".dbss");
-
+        let is_dbss = match file_name.to_str() {
+            Some(s) => s.ends_with(".dbss"),
+            None => false,
+        };
         if level >= &ReadLevel::Decrypt && !is_dbss && !buf.is_empty() {
             self.ice.decrypt_auto(&mut buf);
         }
@@ -410,39 +367,21 @@ impl MetaFile {
         Ok(buf)
     }
 
-    /// Builds a path cache from the meta table for use with `extract_many` ensuring
-    /// that all directories are created.
-    fn build_path_cache(&self, out_path: &Path) -> IntMap<u32, PathBuf> {
-        let mut path_cache: IntMap<u32, PathBuf> =
-            IntMap::with_capacity_and_hasher(self.path_table.len(), BuildNoHashHasher::default());
-
-        let mut last_path_id = u32::MAX;
-        for mr in &self.meta_table {
-            if mr.path_id == last_path_id {
-                continue;
-            }
-
-            let dir = &self.path_table[mr.path_id as usize].path;
-            let full_path = out_path.join(dir);
-            let _ = std::fs::create_dir_all(&full_path);
-            path_cache.insert(mr.path_id, full_path);
-            last_path_id = mr.path_id;
-        }
-        path_cache
-    }
-
-    /// Extracts all (remaining) records in the meta table.
-    ///
-    /// NOTE: This is normally called after filtering by path and/or file names.
+    /// Extracts all records from the archive.
     pub fn extract_many(&self, level: &ReadLevel, out_path: &Path) -> Result<(), Box<dyn Error>> {
-        let path_cache = self.build_path_cache(out_path);
+        self.meta_table
+            .iter()
+            .map(|mr| self.path_table[mr.path_id as usize].path.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .for_each(|p| std::fs::create_dir_all(out_path.join(p)).expect("create dir failed"));
 
         self.meta_table.par_iter().for_each_init(
             || Vec::with_capacity(8_192),
             |buf, mr| {
-                let base_path = path_cache.get(&mr.path_id).unwrap();
+                let dir = self.path_table[mr.path_id as usize].path.clone();
                 let file_name = &self.file_table[mr.file_id as usize];
-                let out = base_path.join(file_name);
+                let out = out_path.join(dir).join(file_name);
 
                 if let Err(e) = self.extract_with_buffer(mr, level, &out, buf) {
                     eprintln!("Failed extracting {}: {}", out.display(), e);
@@ -462,23 +401,24 @@ impl MetaFile {
         let mut f = std::fs::File::open(self.package_path(record))?;
         f.seek(SeekFrom::Start(record.package_offset as u64))?;
 
-        // SAFETY: This is safe because reserve ensures that the buffer has enough space,
-        //         and the next operation 'read_exact' is a total overwrite of the new len.
-        //         If we could signal maybe uninit during the thread init, we could use that instead.
-        unsafe {
-            #[allow(clippy::uninit_vec)]
-            let sz_compressed = record.sz_compressed as usize;
-            buf.reserve(sz_compressed.saturating_sub(buf.len()));
-            buf.set_len(sz_compressed);
-            f.read_exact(buf)?;
-        };
+        let sz_compressed = record.sz_compressed as usize;
+        buf.reserve(sz_compressed.saturating_sub(buf.len()));
 
+        // SAFETY: We are immediately following this with read_exact, which fills
+        //         exactly 'sz' bytes. This avoids the zero-initialization cost of
+        //         buf.resize(sz, 0).
+        //         This is safe because the next operation 'read_exact' is a total overwrite.
+        unsafe { buf.set_len(sz_compressed) };
+
+        f.read_exact(buf)?;
         if buf.is_empty() {
             return Ok(());
         }
 
-        let file_name = &self.file_table[record.file_id as usize];
-        let is_dbss = file_name.ends_with(".dbss");
+        let is_dbss = match &self.file_table[record.file_id as usize].to_str() {
+            Some(s) => s.ends_with(".dbss"),
+            None => false,
+        };
 
         if level >= &ReadLevel::Decrypt && !is_dbss {
             self.ice.decrypt_auto(buf);
@@ -488,7 +428,7 @@ impl MetaFile {
         //       However, some files (marked with a 0x6E header) are compressed via QuickLZ but,
         //       due to byte alignment and padding, have a `sz_compressed` equal to or greater
         //       than `sz_original`.
-        //       This happens when a file blob was in a previously compressed state.
+        //       This happens when a byte pattern is in a previously compressed state.
         if level >= &ReadLevel::Decompress
             && (record.sz_original > record.sz_compressed || (!is_dbss && buf[0] == 0x6E))
         {
@@ -502,14 +442,15 @@ impl MetaFile {
 
     /// This method filters the internal meta table based on regex file name patterns
     /// and can be called multiple times.
-    pub fn filter_by_file(&mut self, pattern: &str) {
-        let re = regex::Regex::new(pattern).expect("invalid file regex pattern");
+    pub fn filter_by_file(&mut self, pattern: &str) -> Result<(), Box<dyn Error>> {
+        let re = regex::Regex::new(pattern).expect("invalid regex");
         self.meta_table = self
             .meta_table
             .par_iter()
-            .filter(|mr| re.is_match(self.file_table[mr.file_id as usize].as_ref()))
+            .filter(|mr| re.is_match(self.file_table[mr.file_id as usize].to_str().unwrap()))
             .cloned()
             .collect();
+        Ok(())
     }
 
     /// This method filters the internal meta table based on regex path patterns.
@@ -518,14 +459,15 @@ impl MetaFile {
     ///         `path_table`. This should only be called once as a pre-processing step before
     ///         extraction, as subsequent calls to `filter_by_path` will likely panic from
     ///         index out of bounds or return incorrect data.
-    pub fn filter_by_path(&mut self, pattern: &str) {
-        let re = regex::Regex::new(pattern).expect("invalid path regex pattern");
+    pub fn filter_by_path(&mut self, pattern: &str) -> Result<(), Box<dyn Error>> {
+        let re = regex::Regex::new(pattern).expect("invalid regex");
         self.meta_table = self
             .path_table
             .iter()
-            .filter(|pr| re.is_match(pr.path.as_ref()))
+            .filter(|pr| re.is_match(pr.path.to_str().unwrap()))
             .flat_map(|pr| self.meta_table[pr.file_range.clone()].to_vec())
             .collect();
+        Ok(())
     }
 
     /// Returns the name of the package file for use in file paths.
