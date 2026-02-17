@@ -37,22 +37,30 @@ fn meta_parse() {
     assert_eq!(meta.version, 1892, "version mismatch");
 
     // Package table
-    assert_eq!(meta.package_table.len(), 7700, "package table len mismatch");
+    assert_eq!(
+        meta.package_table_ref().len(),
+        7700,
+        "package table len mismatch"
+    );
 
-    let package_record = meta.package_table.first().unwrap();
+    let package_record = meta.package_table_ref().first().unwrap();
     assert_eq!(package_record.id, 1, "package id mismatch");
     assert_eq!(package_record.hash, 879459305, "package hash mismatch");
     assert_eq!(package_record.size, 9863228, "package size mismatch");
 
-    let package_record = meta.package_table.last().unwrap();
+    let package_record = meta.package_table_ref().last().unwrap();
     assert_eq!(package_record.id, 7700, "package id mismatch");
     assert_eq!(package_record.hash, 4047003738, "package hash mismatch");
     assert_eq!(package_record.size, 174196, "package size mismatch");
 
     // Meta table
-    assert_eq!(meta.meta_table.len(), 597589, "meta table len mismatch");
+    assert_eq!(
+        meta.meta_table_ref().len(),
+        597589,
+        "meta table len mismatch"
+    );
 
-    let meta_record = meta.meta_table.first().unwrap();
+    let meta_record = meta.meta_record_as_ref(0);
     assert_eq!(meta_record.hash, 3751579307, "meta hash mismatch");
     assert_eq!(meta_record.path_id, 0, "meta path id mismatch");
     assert_eq!(meta_record.file_id, 0, "meta file id mismatch");
@@ -67,7 +75,7 @@ fn meta_parse() {
         "meta original size mismatch"
     );
 
-    let meta_record = meta.meta_table.last().unwrap();
+    let meta_record = meta.meta_record_as_ref(meta.active_records.len() - 1);
     assert_eq!(meta_record.hash, 1207248531, "meta hash mismatch");
     assert_eq!(meta_record.path_id, 6320, "meta path id mismatch");
     assert_eq!(meta_record.file_id, 597588, "meta file id mismatch");
@@ -130,12 +138,12 @@ fn path_filter() {
 
     // Filters without qualifiers.
     let mut meta = MetaFile::new_from_path(&ROOT, KEY).expect("meta parsing error");
-    let old_package_table_len = meta.package_table.len();
+    let old_package_table_len = meta.package_table_ref().len();
     let old_path_table_len = meta.path_table.len();
     let old_file_table_len = meta.file_table.len();
     meta.filter_by_path("character");
     assert_eq!(
-        meta.package_table.len(),
+        meta.package_table_ref().len(),
         old_package_table_len,
         "(w/o qualifiers) package table len mismatch"
     );
@@ -150,7 +158,7 @@ fn path_filter() {
         "(w/o qualifiers) file table len mismatch"
     );
     assert_eq!(
-        meta.meta_table.len(),
+        meta.active_records.count_ones(..),
         156958,
         "(w/o qualifiers)meta table len mismatch"
     );
@@ -159,7 +167,7 @@ fn path_filter() {
     let mut meta = MetaFile::new_from_path(&ROOT, KEY).expect("meta parsing error");
     meta.filter_by_path("^character/ai_.*k/");
     assert_eq!(
-        meta.package_table.len(),
+        meta.package_table_ref().len(),
         old_package_table_len,
         "(w/ qualifiers) package table len mismatch"
     );
@@ -174,7 +182,7 @@ fn path_filter() {
         "(w/ qualifiers)file table len mismatch"
     );
     assert_eq!(
-        meta.meta_table.len(),
+        meta.active_records.count_ones(..),
         37,
         "(w/ qualifiers)meta table len mismatch"
     );
@@ -189,12 +197,12 @@ fn file_filter() {
 
     // Filters without qualifiers.
     let mut meta = MetaFile::new_from_path(&ROOT, KEY).expect("meta parsing error");
-    let old_package_table_len = meta.package_table.len();
+    let old_package_table_len = meta.package_table_ref().len();
     let old_path_table_len = meta.path_table.len();
     let old_file_table_len = meta.file_table.len();
     meta.filter_by_file("cloud");
     assert_eq!(
-        meta.package_table.len(),
+        meta.package_table_ref().len(),
         old_package_table_len,
         "(w/o qualifiers) package table len mismatch"
     );
@@ -209,7 +217,7 @@ fn file_filter() {
         "(w/o qualifiers) file table len mismatch"
     );
     assert_eq!(
-        meta.meta_table.len(),
+        meta.active_records.count_ones(..),
         40,
         "(w/o qualifiers)meta table len mismatch"
     );
@@ -218,7 +226,7 @@ fn file_filter() {
     let mut meta = MetaFile::new_from_path(&ROOT, KEY).expect("meta parsing error");
     meta.filter_by_file("^cloud.*fx");
     assert_eq!(
-        meta.package_table.len(),
+        meta.package_table_ref().len(),
         old_package_table_len,
         "(w/ qualifiers) package table len mismatch"
     );
@@ -233,7 +241,7 @@ fn file_filter() {
         "(w/ qualifiers)file table len mismatch"
     );
     assert_eq!(
-        meta.meta_table.len(),
+        meta.active_records.count_ones(..),
         4,
         "(w/ qualifiers)meta table len mismatch"
     );

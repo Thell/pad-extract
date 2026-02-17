@@ -5,14 +5,12 @@ use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 
-use bytemuck::allocation::pod_collect_to_vec;
-use bytemuck::{Pod, Zeroable};
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
+use fixedbitset::FixedBitSet;
 use icefast::Ice;
 use nohash_hasher::{BuildNoHashHasher, IntMap};
 use rayon::prelude::*;
-use rdst::{RadixKey, RadixSort};
 
 /// The level of processing to use on the data to read from the archive.
 ///
@@ -43,17 +41,17 @@ enum BlockType {
 ///         is positioned at the start of the appropriate block.
 fn block_range(
     block: BlockType,
-    reader: &mut Cursor<&[u8]>,
+    reader: &mut Cursor<&Vec<u8>>,
 ) -> Result<std::ops::Range<usize>, Box<dyn Error>> {
-    let count = reader.read_u32::<LittleEndian>()? as u64;
-    let start = reader.position();
+    let count = reader.read_u32::<LittleEndian>()? as usize;
+    let start = reader.position() as usize;
     let end = match block {
-        BlockType::Packages => start + count * 12,
-        BlockType::Metas => start + count * 28,
+        BlockType::Packages => start + count * std::mem::size_of::<PackageRecord>(),
+        BlockType::Metas => start + count * std::mem::size_of::<MetaRecord>(),
         BlockType::Paths => start + count,
         BlockType::Files => start + count,
     };
-    reader.set_position(end);
+    reader.set_position(end as u64);
     Ok(start as usize..end as usize)
 }
 
@@ -62,7 +60,7 @@ fn block_range(
 /// They can be utilized to validate the data archive or to differentiate
 /// packages across versions.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy)]
 pub struct PackageRecord {
     pub id: u32,
     pub hash: u32,
@@ -87,54 +85,6 @@ pub struct MetaRecord {
     pub package_offset: u32,
     pub sz_compressed: u32,
     pub sz_original: u32,
-}
-
-impl RadixKey for MetaRecord {
-    const LEVELS: usize = 4;
-
-    #[inline]
-    fn get_level(&self, level: usize) -> u8 {
-        // NOTE: We sort by file_id in order to facilitate an initial 1:1
-        //        path bucket range to file range index mapping for path filter.
-        (self.file_id >> (level * 8)) as u8
-    }
-}
-
-impl MetaRecord {
-    // NOTE: These compile down to almost the exact same code and similar runtimes.
-    //       The time comes down to the memcpy which can be elided using a pure zero-copy
-    //       approach that results in a slice, but then the sort is done which requires
-    //       copy anyway and the record handling during the extraction ends up having
-    //       a indirection and cache misses if an 'active_indices' map is used.
-    //
-    // A:
-    fn from_le_bytes(bytes: &[u8; 28]) -> MetaRecord {
-        let mut reader = Cursor::new(bytes);
-        MetaRecord {
-            hash: reader.read_u32::<LittleEndian>().unwrap(),
-            path_id: reader.read_u32::<LittleEndian>().unwrap(),
-            file_id: reader.read_u32::<LittleEndian>().unwrap(),
-            package_id: reader.read_u32::<LittleEndian>().unwrap(),
-            package_offset: reader.read_u32::<LittleEndian>().unwrap(),
-            sz_compressed: reader.read_u32::<LittleEndian>().unwrap(),
-            sz_original: reader.read_u32::<LittleEndian>().unwrap(),
-        }
-    }
-
-    fn many_from_le_bytes(bytes: &[u8]) -> Vec<MetaRecord> {
-        bytes
-            .par_chunks_exact(28)
-            .map(|chunk| MetaRecord::from_le_bytes(chunk.try_into().unwrap()))
-            .collect()
-    }
-
-    // // B:
-    // fn many_from_le_bytes(bytes: &[u8]) -> Vec<MetaRecord> {
-    //     bytes
-    //         .par_chunks_exact(28)
-    //         .map(|chunk| unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const MetaRecord) })
-    //         .collect()
-    // }
 }
 
 /// A path record consists of the path string and the range of file indices
@@ -185,6 +135,8 @@ impl FileRecord {
             .par_split(|&b| b == 0)
             .map(|chunk| {
                 // NOTE: std::slice is_ascii is slightly faster than encoding_rs is_ascii
+                //       and when it's not ASCII we end up double checking the initial ASCII
+                //       bytes.
                 if chunk.is_ascii() {
                     // SAFETY: is_ascii ensures valid UTF-8 for the slice.
                     unsafe { std::str::from_utf8_unchecked(chunk) }
@@ -199,19 +151,24 @@ impl FileRecord {
 
 #[derive(Debug)]
 pub struct MetaFile {
-    // SAFETY: This field must remain present and immutable for the lifetime of the struct,
-    //         as `path_table` and `file_table` contain slices that borrow directly.
+    // SAFETY: This field must remain present and immutable for the lifetime of the struct.
     #[allow(unused)]
     buf: Vec<u8>,
 
     pub ice: Ice,
     pub root: PathBuf,
     pub version: u32,
-    pub package_table: Vec<PackageRecord>,
-    pub meta_table: Vec<MetaRecord>,
+    package_ptr: *const PackageRecord,
+    package_len: usize,
+    meta_ptr: *const MetaRecord,
+    meta_len: usize,
+    pub record_index: Vec<usize>,
+    pub active_records: FixedBitSet,
     pub path_table: Vec<PathRecord<'static>>,
     pub file_table: Vec<&'static str>,
 }
+
+unsafe impl Sync for MetaFile {}
 
 impl MetaFile {
     /// Creates a new meta file from the root directory containing the `pad00000.meta` file
@@ -233,36 +190,63 @@ impl MetaFile {
     ///
     /// The primary entry point is the `new_from_path` method which uses the `pad00000.meta` file.
     ///
-    /// **SAFETY**: The pad00000.meta file is the source of truth.
-    /// All unsafe operations are based on the assumption that the meta file is correct.
+    /// **SAFETY**: The pad00000.meta file is the read-only fixed format source of truth.
+    ///             All unsafe operations are based on the assumption that the meta file is correct.
     #[cfg(not(feature = "instrumented"))]
     pub fn new(mut buf: Vec<u8>, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
-        // NOTE: ** To filter by bucket indices the meta table must be sorted by file index. **
         let ice = Ice::new(0, key);
         let root = PathBuf::new();
 
-        let mut reader = Cursor::new(buf.as_slice());
+        let (version, package_range, meta_range, path_range, file_range) = {
+            let mut reader = Cursor::new(&buf);
 
-        let version = reader.read_u32::<LittleEndian>().unwrap();
+            let version = reader.read_u32::<LittleEndian>()?;
 
-        let range = block_range(BlockType::Packages, &mut reader)?;
-        let package_table: Vec<PackageRecord> = pod_collect_to_vec(&reader.get_ref()[range]);
+            let package_range = block_range(BlockType::Packages, &mut reader)?;
+            let meta_range = block_range(BlockType::Metas, &mut reader)?;
+            let path_range = block_range(BlockType::Paths, &mut reader)?;
+            let file_range = block_range(BlockType::Files, &mut reader)?;
 
-        let range = block_range(BlockType::Metas, &mut reader)?;
-        let mut meta_table = MetaRecord::many_from_le_bytes(&reader.get_ref()[range]);
-        meta_table.radix_sort_unstable();
+            (version, package_range, meta_range, path_range, file_range)
+        };
 
-        let range_paths = block_range(BlockType::Paths, &mut reader)?;
-        let range_files = block_range(BlockType::Files, &mut reader)?;
+        let (package_ptr, package_len) = {
+            let bytes = &mut buf[package_range];
+            let record_size = std::mem::size_of::<PackageRecord>();
 
-        // SAFETY: We just extracted the ranges, so we know that the ranges are valid
-        //         unless the source material changes format in which case the whole
-        //         extractor will fail.
+            let num = bytes.len() / record_size;
+            let ptr = bytes.as_mut_ptr() as *mut PackageRecord;
+
+            (ptr as *const PackageRecord, num)
+        };
+
+        let (meta_ptr, meta_len, record_index, active_records) = {
+            let bytes = &mut buf[meta_range];
+            let record_size = std::mem::size_of::<MetaRecord>();
+
+            let num = bytes.len() / record_size;
+            let ptr = bytes.as_mut_ptr() as *mut MetaRecord;
+
+            let mut active_records = FixedBitSet::with_capacity(num);
+            active_records.insert_range(..);
+
+            let mut record_index = vec![0_usize; num];
+            unsafe {
+                let metas = std::slice::from_raw_parts(ptr, num);
+                let dst = record_index.as_mut_ptr();
+                for (i, mr) in metas.iter().enumerate() {
+                    dst.add(mr.file_id as usize).write(i);
+                }
+            }
+
+            (ptr as *const MetaRecord, num, record_index, active_records)
+        };
+
         let (paths_slice, files_slice) = unsafe {
             let base = buf.as_mut_ptr();
             (
-                std::slice::from_raw_parts_mut(base.add(range_paths.start), range_paths.len()),
-                std::slice::from_raw_parts_mut(base.add(range_files.start), range_files.len()),
+                std::slice::from_raw_parts_mut(base.add(path_range.start), path_range.len()),
+                std::slice::from_raw_parts_mut(base.add(file_range.start), file_range.len()),
             )
         };
 
@@ -277,8 +261,12 @@ impl MetaFile {
             ice,
             root,
             version,
-            package_table,
-            meta_table,
+            package_ptr,
+            package_len,
+            meta_ptr,
+            meta_len,
+            record_index,
+            active_records,
             path_table,
             file_table,
         })
@@ -289,41 +277,73 @@ impl MetaFile {
     ///
     #[cfg(feature = "instrumented")]
     pub fn new(mut buf: Vec<u8>, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
-        // NOTE: ** To filter by bucket indices the meta table must be sorted by file index. **
         let start_total = std::time::Instant::now();
 
         let ice = Ice::new(0, key);
         let root = PathBuf::new();
 
-        let mut reader = Cursor::new(buf.as_slice());
+        let (version, package_range, meta_range, path_range, file_range) = {
+            let mut reader = Cursor::new(&buf); // immutable borrow only
 
-        let version = reader.read_u32::<LittleEndian>().unwrap();
+            let version = reader.read_u32::<LittleEndian>()?;
 
-        let start_pkgs = std::time::Instant::now();
-        let range = block_range(BlockType::Packages, &mut reader)?;
-        let package_table: Vec<PackageRecord> = pod_collect_to_vec(&reader.get_ref()[range]);
-        let dur_pkgs = start_pkgs.elapsed();
+            let package_range = block_range(BlockType::Packages, &mut reader)?;
+            let meta_range = block_range(BlockType::Metas, &mut reader)?;
+            let path_range = block_range(BlockType::Paths, &mut reader)?;
+            let file_range = block_range(BlockType::Files, &mut reader)?;
 
-        let start_metas = std::time::Instant::now();
-        let range = block_range(BlockType::Metas, &mut reader)?;
-        let mut meta_table = MetaRecord::many_from_le_bytes(&reader.get_ref()[range]);
-        let dur_metas = start_metas.elapsed();
+            (version, package_range, meta_range, path_range, file_range)
+        };
 
-        let start_sort = std::time::Instant::now();
-        meta_table.radix_sort_unstable();
-        let dur_sort = start_sort.elapsed();
+        let (package_ptr, package_len, dur_pkgs) = {
+            let start = std::time::Instant::now();
+            let bytes = &mut buf[package_range];
+            let num = bytes.len() / std::mem::size_of::<PackageRecord>();
+            let ptr = bytes.as_mut_ptr() as *mut PackageRecord;
+            let dur = start.elapsed();
 
-        let range_paths = block_range(BlockType::Paths, &mut reader)?;
-        let range_files = block_range(BlockType::Files, &mut reader)?;
+            (ptr as *const PackageRecord, num, dur)
+        };
 
-        // SAFETY: We just extracted the ranges, so we know that the ranges are valid
-        //         unless the source material changes format in which case the whole
-        //         extractor will fail.
+        let (meta_ptr, meta_len, record_index, active_records, dur_metas, dur_sort) = {
+            let start_parse = std::time::Instant::now();
+            let bytes = &mut buf[meta_range];
+            let record_size = std::mem::size_of::<MetaRecord>();
+            let num = bytes.len() / record_size;
+            let ptr = bytes.as_mut_ptr() as *mut MetaRecord;
+
+            let mut active_records = FixedBitSet::with_capacity(num);
+            active_records.insert_range(..);
+
+            let mut record_index = vec![0_usize; num];
+            unsafe {
+                let metas = std::slice::from_raw_parts(ptr, num);
+                let dst = record_index.as_mut_ptr();
+                for (i, mr) in metas.iter().enumerate() {
+                    dst.add(mr.file_id as usize).write(i);
+                }
+            }
+            let dur_parse = start_parse.elapsed();
+
+            let start_sort = std::time::Instant::now();
+            // No sorting being done
+            let dur_sort = start_sort.elapsed();
+
+            (
+                ptr as *const MetaRecord,
+                num,
+                record_index,
+                active_records,
+                dur_parse,
+                dur_sort,
+            )
+        };
+
         let (paths_slice, files_slice) = unsafe {
             let base = buf.as_mut_ptr();
             (
-                std::slice::from_raw_parts_mut(base.add(range_paths.start), range_paths.len()),
-                std::slice::from_raw_parts_mut(base.add(range_files.start), range_files.len()),
+                std::slice::from_raw_parts_mut(base.add(path_range.start), path_range.len()),
+                std::slice::from_raw_parts_mut(base.add(file_range.start), file_range.len()),
             )
         };
 
@@ -342,9 +362,9 @@ impl MetaFile {
         println!(
             "Parse timings (μs): total={}, packages-parse ({})={}, metas-parse ({})={}, metas-sort={}, paths-parse ({})={}, files-parse ({})={}",
             dur_total.as_micros() as f64,
-            package_table.len(),
+            package_len,
             dur_pkgs.as_micros() as f64,
-            meta_table.len(),
+            meta_len,
             dur_metas.as_micros() as f64,
             dur_sort.as_micros() as f64,
             path_table.len(),
@@ -358,8 +378,12 @@ impl MetaFile {
             ice,
             root,
             version,
-            package_table,
-            meta_table,
+            package_ptr,
+            package_len,
+            meta_ptr,
+            meta_len,
+            record_index,
+            active_records,
             path_table,
             file_table,
         })
@@ -381,7 +405,7 @@ impl MetaFile {
         Ok(std::fs::write(out, buf)?)
     }
 
-    /// Reads and returns a single record from the archive.
+    /// Reads and returns the bytes of a single record from the archive.
     pub fn read(&self, record: &MetaRecord, level: &ReadLevel) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut f = std::fs::File::open(self.package_path(record))?;
         f.seek(SeekFrom::Start(record.package_offset as u64))?;
@@ -410,23 +434,21 @@ impl MetaFile {
         Ok(buf)
     }
 
-    /// Builds a path cache from the meta table for use with `extract_many` ensuring
+    /// Builds a path cache for the active records for use with `extract_many` ensuring
     /// that all directories are created.
     fn build_path_cache(&self, out_path: &Path) -> IntMap<u32, PathBuf> {
         let mut path_cache: IntMap<u32, PathBuf> =
             IntMap::with_capacity_and_hasher(self.path_table.len(), BuildNoHashHasher::default());
 
-        let mut last_path_id = u32::MAX;
-        for mr in &self.meta_table {
-            if mr.path_id == last_path_id {
-                continue;
+        for (i, pr) in self.path_table.iter().enumerate() {
+            if self
+                .active_records
+                .contains_any_in_range(pr.file_range.clone())
+            {
+                let full_path = out_path.join(&pr.path);
+                let _ = std::fs::create_dir_all(&full_path);
+                path_cache.insert(i as u32, full_path);
             }
-
-            let dir = &self.path_table[mr.path_id as usize].path;
-            let full_path = out_path.join(dir);
-            let _ = std::fs::create_dir_all(&full_path);
-            path_cache.insert(mr.path_id, full_path);
-            last_path_id = mr.path_id;
         }
         path_cache
     }
@@ -437,18 +459,23 @@ impl MetaFile {
     pub fn extract_many(&self, level: &ReadLevel, out_path: &Path) -> Result<(), Box<dyn Error>> {
         let path_cache = self.build_path_cache(out_path);
 
-        self.meta_table.par_iter().for_each_init(
-            || Vec::with_capacity(8_192),
-            |buf, mr| {
-                let base_path = path_cache.get(&mr.path_id).unwrap();
-                let file_name = &self.file_table[mr.file_id as usize];
-                let out = base_path.join(file_name);
+        self.active_records
+            .ones()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each_init(
+                || Vec::with_capacity(8_192),
+                |buf, mr_idx| {
+                    let mr = self.meta_record_as_ref(mr_idx);
+                    let base_path = path_cache.get(&mr.path_id).unwrap();
+                    let file_name = self.file_table[mr.file_id as usize];
+                    let out = base_path.join(file_name);
 
-                if let Err(e) = self.extract_with_buffer(mr, level, &out, buf) {
-                    eprintln!("Failed extracting {}: {}", out.display(), e);
-                }
-            },
-        );
+                    if let Err(e) = self.extract_with_buffer(mr, level, &out, buf) {
+                        eprintln!("Failed extracting {}: {}", out.display(), e);
+                    }
+                },
+            );
         Ok(())
     }
 
@@ -466,9 +493,9 @@ impl MetaFile {
         //         and the next operation 'read_exact' is a total overwrite of the new len.
         //         If we could signal maybe uninit during the thread init, we could use that instead.
         unsafe {
-            #[allow(clippy::uninit_vec)]
             let sz_compressed = record.sz_compressed as usize;
             buf.reserve(sz_compressed.saturating_sub(buf.len()));
+            #[allow(clippy::uninit_vec)]
             buf.set_len(sz_compressed);
             f.read_exact(buf)?;
         };
@@ -477,8 +504,7 @@ impl MetaFile {
             return Ok(());
         }
 
-        let file_name = &self.file_table[record.file_id as usize];
-        let is_dbss = file_name.ends_with(".dbss");
+        let is_dbss = self.file_table[record.file_id as usize].ends_with(".dbss");
 
         if level >= &ReadLevel::Decrypt && !is_dbss {
             self.ice.decrypt_auto(buf);
@@ -488,7 +514,7 @@ impl MetaFile {
         //       However, some files (marked with a 0x6E header) are compressed via QuickLZ but,
         //       due to byte alignment and padding, have a `sz_compressed` equal to or greater
         //       than `sz_original`.
-        //       This happens when a file blob was in a previously compressed state.
+        //       This happens when a file blob was in a pre-compressed state.
         if level >= &ReadLevel::Decompress
             && (record.sz_original > record.sz_compressed || (!is_dbss && buf[0] == 0x6E))
         {
@@ -500,32 +526,69 @@ impl MetaFile {
         Ok(std::fs::write(out, buf)?)
     }
 
-    /// This method filters the internal meta table based on regex file name patterns
-    /// and can be called multiple times.
+    /// Filters the current active records based on regex file name patterns.
     pub fn filter_by_file(&mut self, pattern: &str) {
         let re = regex::Regex::new(pattern).expect("invalid file regex pattern");
-        self.meta_table = self
-            .meta_table
-            .par_iter()
-            .filter(|mr| re.is_match(self.file_table[mr.file_id as usize].as_ref()))
-            .cloned()
+
+        let matches: Vec<usize> = self
+            .active_records
+            .ones()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .filter(|&i| {
+                let mr = self.meta_record_as_ref(i);
+                let name = self.file_table[mr.file_id as usize];
+                re.is_match(name)
+            })
             .collect();
+
+        self.active_records.clear();
+        for i in matches {
+            self.active_records.insert(i);
+        }
     }
 
-    /// This method filters the internal meta table based on regex path patterns.
+    /// Initializes the active records based on regex path patterns.
     ///
-    /// SAFETY: This operation is destructive and invalidates the `file_range` indices in the
-    ///         `path_table`. This should only be called once as a pre-processing step before
-    ///         extraction, as subsequent calls to `filter_by_path` will likely panic from
-    ///         index out of bounds or return incorrect data.
+    /// NOTE: This overwrites any previous path or file filtering.
     pub fn filter_by_path(&mut self, pattern: &str) {
         let re = regex::Regex::new(pattern).expect("invalid path regex pattern");
-        self.meta_table = self
-            .path_table
+
+        self.active_records.clear();
+        self.path_table
             .iter()
             .filter(|pr| re.is_match(pr.path.as_ref()))
-            .flat_map(|pr| self.meta_table[pr.file_range.clone()].to_vec())
-            .collect();
+            .for_each(|pr| self.active_records.insert_range(pr.file_range.clone()));
+    }
+
+    /// Returns a reference to a meta record.
+    #[inline(always)]
+    pub fn meta_record_as_ref(&self, file_id: usize) -> &MetaRecord {
+        assert!(file_id < self.record_index.len());
+        unsafe { &*self.meta_ptr.add(*self.record_index.get_unchecked(file_id)) }
+    }
+
+    /// Returns a slice view of the meta table.
+    pub fn meta_table_ref(&self) -> &[MetaRecord] {
+        unsafe { std::slice::from_raw_parts(self.meta_ptr, self.meta_len) }
+    }
+
+    /// Returns an iterator over references to active meta records.
+    pub fn active_meta_records_iter<'a>(&'a self) -> impl Iterator<Item = &'a MetaRecord> + 'a {
+        self.active_records
+            .ones()
+            .map(move |file_id| self.meta_record_as_ref(file_id))
+    }
+
+    /// Returns a parallel iterator over references to active meta records.
+    pub fn active_meta_records_par_iter<'a>(
+        &'a self,
+    ) -> impl ParallelIterator<Item = &'a MetaRecord> + 'a {
+        self.active_records
+            .ones()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(move |file_id| self.meta_record_as_ref(file_id))
     }
 
     /// Returns the name of the package file for use in file paths.
@@ -536,5 +599,10 @@ impl MetaFile {
     /// Returns the path to the package file.
     pub fn package_path(&self, record: &MetaRecord) -> PathBuf {
         self.root.join(self.package_name(record))
+    }
+
+    /// Returns a slice view of the package table.
+    pub fn package_table_ref(&self) -> &[PackageRecord] {
+        unsafe { std::slice::from_raw_parts(self.package_ptr, self.package_len) }
     }
 }

@@ -58,7 +58,7 @@ fn b5_read_raw(bench: &mut Bencher) {
         let mut meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         meta.filter_by_path(PATH_FILTER);
         meta.filter_by_file(FILE_FILTER);
-        meta.meta_table.par_iter().for_each(|mr| {
+        meta.active_meta_records_par_iter().for_each(|mr| {
             let buf = meta.read(mr, &ReadLevel::Raw).expect("read failed");
             bencher::black_box(buf);
         });
@@ -70,7 +70,7 @@ fn b6_read_decrypted(bench: &mut Bencher) {
         let mut meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         meta.filter_by_path(PATH_FILTER);
         meta.filter_by_file(FILE_FILTER);
-        meta.meta_table.par_iter().for_each(|mr| {
+        meta.active_meta_records_par_iter().for_each(|mr| {
             let buf = meta.read(mr, &ReadLevel::Decrypt).expect("read failed");
             bencher::black_box(buf);
         });
@@ -82,7 +82,7 @@ fn b7_read_decompressed(bench: &mut Bencher) {
         let mut meta = MetaFile::new_from_path(&ROOT, ICE_KEY).expect("meta parsing error");
         meta.filter_by_path(PATH_FILTER);
         meta.filter_by_file(FILE_FILTER);
-        meta.meta_table.par_iter().for_each(|mr| {
+        meta.active_meta_records_par_iter().for_each(|mr| {
             let buf = meta.read(mr, &ReadLevel::Decompress).expect("read failed");
             bencher::black_box(buf);
         });
