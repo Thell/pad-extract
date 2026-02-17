@@ -59,7 +59,6 @@ fn block_range(
 ///
 /// They can be utilized to validate the data archive or to differentiate
 /// packages across versions.
-#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PackageRecord {
     pub id: u32,
@@ -75,7 +74,11 @@ pub struct PackageRecord {
 /// The `path_id`, `file_id` and `package_id` fields are indices into the
 /// path table, file table and package table respectively.
 ///
-/// sz_original accounts for both decryption and decompression.
+/// NOTE: A file is generally compressed if the original size exceeds the compressed size.
+///       However, some files (marked with a 0x6E header) are compressed via QuickLZ but,
+///       due to byte alignment and padding, have a `sz_compressed` equal to or greater
+///       than `sz_original` in which case the header is simply stripped.
+///       This happens when a file blob was in a pre-compressed state.
 #[derive(Debug, Clone, Copy)]
 pub struct MetaRecord {
     pub hash: u32,
@@ -134,9 +137,8 @@ impl FileRecord {
         bytes
             .par_split(|&b| b == 0)
             .map(|chunk| {
-                // NOTE: std::slice is_ascii is slightly faster than encoding_rs is_ascii
-                //       and when it's not ASCII we end up double checking the initial ASCII
-                //       bytes.
+                // NOTE: std::slice is_ascii is slightly faster than encoding_rs is_ascii.
+                //       When it's not ASCII we end up double checking the initial ASCII bytes.
                 if chunk.is_ascii() {
                     // SAFETY: is_ascii ensures valid UTF-8 for the slice.
                     unsafe { std::str::from_utf8_unchecked(chunk) }
@@ -162,8 +164,8 @@ pub struct MetaFile {
     package_len: usize,
     meta_ptr: *const MetaRecord,
     meta_len: usize,
-    pub record_index: Vec<usize>,
     pub active_records: FixedBitSet,
+    pub record_index: Vec<usize>,
     pub path_table: Vec<PathRecord<'static>>,
     pub file_table: Vec<&'static str>,
 }
@@ -174,10 +176,8 @@ impl MetaFile {
     /// Creates a new meta file from the root directory containing the `pad00000.meta` file
     /// and using the provided encryption key.
     ///
-    /// The `pad00000.meta`` path table is organized such that each path entry is a bucket
-    /// of file indices and is organized for hash lookups, but this library organizes it for
-    /// efficient filtering and extraction by directly using the path table bucket indices
-    /// on the meta table records.
+    /// **SAFETY**: The pad00000.meta file is the read-only fixed format source of truth.
+    ///             All unsafe operations are based on the assumption that the meta file is correct.
     pub fn new_from_path(root: &Path, key: &[u8; 8]) -> Result<Self, Box<dyn Error>> {
         let metafile = PathBuf::from("pad00000.meta");
         let buf = std::fs::read(root.join(metafile))?;
@@ -283,7 +283,7 @@ impl MetaFile {
         let root = PathBuf::new();
 
         let (version, package_range, meta_range, path_range, file_range) = {
-            let mut reader = Cursor::new(&buf); // immutable borrow only
+            let mut reader = Cursor::new(&buf);
 
             let version = reader.read_u32::<LittleEndian>()?;
 
@@ -326,7 +326,7 @@ impl MetaFile {
             let dur_parse = start_parse.elapsed();
 
             let start_sort = std::time::Instant::now();
-            // No sorting being done
+            // No sorting being done but keep this for consistency during experiments
             let dur_sort = start_sort.elapsed();
 
             (
@@ -412,8 +412,7 @@ impl MetaFile {
         let mut buf = vec![0; record.sz_compressed as usize];
         f.read_exact(&mut buf)?;
 
-        let file_name = &self.file_table[record.file_id as usize];
-        let is_dbss = file_name.ends_with(".dbss");
+        let is_dbss = self.file_table[record.file_id as usize].ends_with(".dbss");
 
         if level >= &ReadLevel::Decrypt && !is_dbss && !buf.is_empty() {
             self.ice.decrypt_auto(&mut buf);
@@ -425,9 +424,7 @@ impl MetaFile {
             {
                 let mut r = Cursor::new(&buf);
                 buf = quicklz::decompress(&mut r, record.sz_original)?;
-            }
-            if record.sz_original < record.sz_compressed {
-                buf = buf[0..record.sz_original as usize].to_vec();
+                buf.truncate(record.sz_original as usize);
             }
         }
 
@@ -491,7 +488,8 @@ impl MetaFile {
 
         // SAFETY: This is safe because reserve ensures that the buffer has enough space,
         //         and the next operation 'read_exact' is a total overwrite of the new len.
-        //         If we could signal maybe uninit during the thread init, we could use that instead.
+        //         If we could signal MaybeUninit during the thread init, we could use that instead
+        //         if ICE and quicklz could handle that.
         unsafe {
             let sz_compressed = record.sz_compressed as usize;
             buf.reserve(sz_compressed.saturating_sub(buf.len()));
@@ -513,7 +511,7 @@ impl MetaFile {
         // NOTE: A file is generally compressed if the original size exceeds the compressed size.
         //       However, some files (marked with a 0x6E header) are compressed via QuickLZ but,
         //       due to byte alignment and padding, have a `sz_compressed` equal to or greater
-        //       than `sz_original`.
+        //       than `sz_original` in which case the header is simply stripped.
         //       This happens when a file blob was in a pre-compressed state.
         if level >= &ReadLevel::Decompress
             && (record.sz_original > record.sz_compressed || (!is_dbss && buf[0] == 0x6E))
@@ -527,6 +525,8 @@ impl MetaFile {
     }
 
     /// Filters the current active records based on regex file name patterns.
+    ///
+    /// NOTE: Filter by path first for performance.
     pub fn filter_by_file(&mut self, pattern: &str) {
         let re = regex::Regex::new(pattern).expect("invalid file regex pattern");
 
