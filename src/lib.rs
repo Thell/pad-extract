@@ -605,4 +605,18 @@ impl MetaFile {
     pub fn package_table_ref(&self) -> &[PackageRecord] {
         unsafe { std::slice::from_raw_parts(self.package_ptr, self.package_len) }
     }
+
+    /// Sets the active records to all records.
+    pub fn reset_active_records(&mut self) {
+        self.active_records.clear();
+        self.active_records.insert_range(..);
+    }
+
+    /// Set the active records from the given Vec of file IDs.
+    pub fn set_active_records_from_ids(&mut self, ids: &Vec<u32>) {
+        self.active_records.clear();
+        for &id in ids {
+            self.active_records.insert(id as usize);
+        }
+    }
 }
