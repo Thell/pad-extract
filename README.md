@@ -8,3 +8,5 @@ A packaged archive directory (PAD) is a directory of compressed and encrypted fi
 - text encoded using EUC-KR
 
 This library provides parsing of the meta data and file extraction from a package.
+
+See benches and tests for usage.
